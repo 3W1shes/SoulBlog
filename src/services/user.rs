@@ -55,10 +55,7 @@ impl UserService {
 
         // 生成唯一用户名
         let mut profile = UserProfile {
-            id: Thing {
-                tb: "user_profile".to_string(),
-                id: surrealdb::sql::Id::String(Uuid::new_v4().to_string()),
-            },
+            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
             user_id: user_id.to_string(),
             username: original_username.clone(),
             display_name: original_username.clone(),
@@ -439,7 +436,7 @@ impl UserService {
 
         // 获取用户给出的拍手数
         let claps_given_query = r#"
-            SELECT COALESCE(sum(count), 0) as total_claps 
+            SELECT math::sum(count) as total_claps 
             FROM clap 
             WHERE user_id = $user_id
         "#;
@@ -465,10 +462,11 @@ impl UserService {
 
         // 获取用户收到的拍手数（通过用户的文章）
         let claps_received_query = r#"
-            SELECT sum(c.count) as total_claps 
-            FROM clap c
-            JOIN article a ON c.article_id = a.id
-            WHERE a.author_id = $user_id
+            SELECT math::sum(count) as total_claps
+            FROM clap
+            WHERE article_id IN (
+                SELECT id FROM article WHERE author_id = $user_id
+            )
         "#;
 
         let mut claps_received_response = self
@@ -719,10 +717,7 @@ impl UserService {
 
         // 生成唯一用户名
         let mut profile = UserProfile {
-            id: Thing {
-                tb: "user_profile".to_string(),
-                id: surrealdb::sql::Id::String(Uuid::new_v4().to_string()),
-            },
+            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
             user_id: user_id.to_string(),
             username: original_username.clone(),
             display_name: display_name.unwrap_or_else(|| original_username.clone()),

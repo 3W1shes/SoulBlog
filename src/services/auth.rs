@@ -2,11 +2,12 @@ use crate::{config::Config, error::{AppError, Result}};
 use axum::{
     async_trait,
     extract::{FromRequestParts, State},
-    headers::{authorization::Bearer, Authorization},
     http::{request::Parts, StatusCode},
     Extension,
-    RequestPartsExt, TypedHeader,
+    RequestPartsExt,
 };
+use axum_extra::typed_header::TypedHeader;
+use headers::{authorization::Bearer, Authorization};
 use jsonwebtoken::{decode, DecodingKey, Validation, Algorithm};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,12 @@ pub struct RainbowAuthUserResponse {
     pub last_login_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RainbowAuthMeResponse {
+    pub success: bool,
+    pub data: RainbowAuthUserResponse,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "PascalCase")]
 pub enum RainbowAuthAccountStatus {
@@ -228,12 +235,22 @@ impl AuthService {
         
         debug!("Rainbow-Auth response: {}", response_text);
         
-        // 尝试解析响应
-        let user_data: RainbowAuthUserResponse = serde_json::from_str(&response_text)
-            .map_err(|e| {
-                error!("Failed to parse Rainbow-Auth response: {}, response was: {}", e, response_text);
-                AppError::Authentication("Invalid response from Rainbow-Auth".to_string())
-            })?;
+        // 尝试解析响应（支持直接对象或 { success, data } 包装）
+        let user_data: RainbowAuthUserResponse = match serde_json::from_str(&response_text) {
+            Ok(data) => data,
+            Err(err_direct) => {
+                match serde_json::from_str::<RainbowAuthMeResponse>(&response_text) {
+                    Ok(wrapped) => wrapped.data,
+                    Err(err_wrapped) => {
+                        error!(
+                            "Failed to parse Rainbow-Auth response. direct err: {}, wrapped err: {}, response was: {}",
+                            err_direct, err_wrapped, response_text
+                        );
+                        return Err(AppError::Authentication("Invalid response from Rainbow-Auth".to_string()));
+                    }
+                }
+            }
+        };
 
         // 获取用户权限（为博客系统定制）
         let permissions = self.get_blog_permissions(&user_data.id, token).await?;

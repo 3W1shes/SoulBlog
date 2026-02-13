@@ -1,6 +1,7 @@
 use crate::{
     error::{AppError, Result},
     services::auth::User,
+    utils::middleware::OptionalAuth,
     state::AppState,
 };
 use axum::{
@@ -8,7 +9,6 @@ use axum::{
     response::Json,
     routing::get,
     Router,
-    Extension,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -30,8 +30,12 @@ pub fn router() -> Router<Arc<AppState>> {
 /// 这个端点主要是返回通过 JWT 解析得到的用户信息
 pub async fn get_current_user(
     State(app_state): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
+    OptionalAuth(user): OptionalAuth,
 ) -> Result<Json<Value>> {
+    let user = match user {
+        Some(user) => user,
+        None => return Err(AppError::Authentication("Not authenticated".to_string())),
+    };
     debug!("Getting current user info for user: {}", user.id);
 
     // 获取或创建用户资料（包含邮箱验证状态）
@@ -72,12 +76,12 @@ pub async fn get_current_user(
 /// 这个端点可以被未认证的用户访问，用于检查当前的认证状态
 pub async fn get_auth_status(
     State(_app_state): State<Arc<AppState>>,
-    user: Option<Extension<User>>,
+    OptionalAuth(user): OptionalAuth,
 ) -> Result<Json<Value>> {
     debug!("Checking authentication status");
 
     match user {
-        Some(Extension(user)) => {
+        Some(user) => {
             Ok(Json(json!({
                 "success": true,
                 "data": {
@@ -113,8 +117,12 @@ pub async fn get_auth_status(
 /// 用于刷新用户的认证状态和获取最新的用户信息
 pub async fn get_auth_info(
     State(app_state): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
+    OptionalAuth(user): OptionalAuth,
 ) -> Result<Json<Value>> {
+    let user = match user {
+        Some(user) => user,
+        None => return Err(AppError::Authentication("Not authenticated".to_string())),
+    };
     debug!("Refreshing auth info for user: {}", user.id);
 
     // 获取最新的用户资料
@@ -173,8 +181,12 @@ pub async fn get_auth_info(
 /// 专门用于检查用户邮箱验证状态的端点
 pub async fn get_email_verification_status(
     State(app_state): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
+    OptionalAuth(user): OptionalAuth,
 ) -> Result<Json<Value>> {
+    let user = match user {
+        Some(user) => user,
+        None => return Err(AppError::Authentication("Not authenticated".to_string())),
+    };
     debug!("Getting email verification status for user: {}", user.id);
 
     // 获取用户资料（包含最新的邮箱验证状态）

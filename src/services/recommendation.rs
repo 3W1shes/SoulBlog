@@ -12,16 +12,40 @@ use crate::{
     },
     services::Database,
 };
+use crate::services::article::normalize_surreal_json;
 use std::sync::Arc;
 use std::collections::HashMap;
 use chrono::{Duration, Utc};
-use serde_json::{json, Value};
+use serde::de::DeserializeOwned;
+use serde_json::{json, Value as JsonValue};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
+use surrealdb::Value as SurrealValue;
 
 #[derive(Clone)]
 pub struct RecommendationService {
     db: Arc<Database>,
+}
+
+fn surreal_value_to_json_list(raw: SurrealValue) -> Result<Vec<JsonValue>> {
+    let raw_json = serde_json::to_value(raw)?;
+    let list_json = normalize_surreal_json(raw_json);
+    let items: Vec<JsonValue> = serde_json::from_value(list_json)?;
+    Ok(items)
+}
+
+fn surreal_value_to_t_list<T: DeserializeOwned>(raw: SurrealValue) -> Result<Vec<T>> {
+    let items = surreal_value_to_json_list(raw)?;
+    let mut out = Vec::new();
+    for item in items {
+        match serde_json::from_value::<T>(item) {
+            Ok(value) => out.push(value),
+            Err(err) => {
+                warn!("Skipping item due to deserialization error: {}", err);
+            }
+        }
+    }
+    Ok(out)
 }
 
 impl RecommendationService {
@@ -171,17 +195,19 @@ impl RecommendationService {
         }
 
         // 过滤最近7天的文章以获得真正的"热门"
-        query.push_str(" AND created_at >= $week_ago");
-        params["week_ago"] = json!(Utc::now() - Duration::days(7));
+        let week_ago = (Utc::now() - Duration::days(7)).to_rfc3339();
+        query.push_str(&format!(" AND created_at >= d'{}'", week_ago));
 
         query.push_str(" ORDER BY trending_score DESC, created_at DESC LIMIT $limit");
 
         let mut response = self.db.query_with_params(&query, params).await?;
-        let articles: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let articles: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
 
         let mut recommendations = Vec::new();
         for (i, article_data) in articles.iter().enumerate() {
-            if let Ok(article) = serde_json::from_value::<Article>(article_data.clone()) {
+            let normalized = normalize_surreal_json(article_data.clone());
+            if let Ok(article) = serde_json::from_value::<Article>(normalized) {
                 let list_item = self.article_to_list_item(&article).await?;
 
                 let score = article_data.get("trending_score")
@@ -211,13 +237,14 @@ impl RecommendationService {
         let uid = user_id.ok_or_else(|| AppError::Authentication("User ID required for following recommendations".to_string()))?;
 
         let query = r#"
-            SELECT a.*, f.created_at as follow_date
-            FROM article a
-            JOIN follow f ON a.author_id = f.following_user_id
-            WHERE f.follower_user_id = $user_id
-            AND a.status = 'published'
-            AND a.is_deleted = false
-            ORDER BY a.created_at DESC
+            SELECT *
+            FROM article
+            WHERE author_id IN (
+                SELECT following_user_id FROM follow WHERE follower_user_id = $user_id
+            )
+            AND status = 'published'
+            AND is_deleted = false
+            ORDER BY created_at DESC
             LIMIT $limit
         "#;
 
@@ -225,12 +252,13 @@ impl RecommendationService {
             "user_id": uid,
             "limit": limit
         })).await?;
-
-        let articles: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let articles: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
         let mut recommendations = Vec::new();
 
         for article_data in articles.iter() {
-            if let Ok(article) = serde_json::from_value::<Article>(article_data.clone()) {
+            let normalized = normalize_surreal_json(article_data.clone());
+            if let Ok(article) = serde_json::from_value::<Article>(normalized) {
                 let list_item = self.article_to_list_item(&article).await?;
 
                 recommendations.push(RecommendedArticle {
@@ -253,7 +281,8 @@ impl RecommendationService {
             "user_id": user_id
         })).await?;
         
-        let clapped_articles: Vec<Value> = clap_response.take(0)?;
+        let clapped_raw: SurrealValue = clap_response.take(0)?;
+        let clapped_articles: Vec<JsonValue> = surreal_value_to_json_list(clapped_raw)?;
         if clapped_articles.is_empty() {
             return Ok(Vec::new());
         }
@@ -269,12 +298,14 @@ impl RecommendationService {
                 if let Ok(mut tags_response) = self.db.query_with_params(tags_query, json!({
                     "article_id": article_id
                 })).await {
-                    if let Ok(tag_relations) = tags_response.take::<Vec<Value>>(0) {
+                    if let Ok(tag_relations_raw) = tags_response.take::<SurrealValue>(0) {
+                        let tag_relations = surreal_value_to_json_list(tag_relations_raw)?;
                         for rel in tag_relations {
                             if let Some(tag_id) = rel.get("tag_id").and_then(|v| v.as_str()) {
                                 // 获取标签信息
                                 if let Ok(mut tag_response) = self.db.query(&format!("SELECT * FROM {}", tag_id)).await {
-                                    if let Ok(tags) = tag_response.take::<Vec<Value>>(0) {
+                                    if let Ok(tags_raw) = tag_response.take::<SurrealValue>(0) {
+                                        let tags = surreal_value_to_json_list(tags_raw)?;
                                         if let Some(tag) = tags.first() {
                                             if let (Some(id), Some(name)) = (
                                                 tag.get("id").and_then(|v| v.as_str()),
@@ -311,34 +342,50 @@ impl RecommendationService {
 
     /// 获取用户偏好作者
     async fn get_user_preferred_authors(&self, user_id: &str) -> Result<Vec<AuthorPreference>> {
-        let query = r#"
-            SELECT a.author_id, count() * 1.0 as weight
-            FROM article a
-            JOIN clap c ON a.id = c.article_id
-            WHERE c.user_id = $user_id
-            GROUP BY a.author_id
-            ORDER BY weight DESC
-            LIMIT 10
-        "#;
-
-        let mut response = self.db.query_with_params(query, json!({
+        // 先获取用户点赞的文章，再在 Rust 中聚合作者偏好
+        let clapped_query = "SELECT article_id FROM clap WHERE user_id = $user_id";
+        let mut clap_response = self.db.query_with_params(clapped_query, json!({
             "user_id": user_id
         })).await?;
 
-        let results: Vec<Value> = response.take(0)?;
-        let mut preferences = Vec::new();
+        let raw: SurrealValue = clap_response.take(0)?;
+        let clapped: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
+        let article_ids: Vec<String> = clapped
+            .iter()
+            .filter_map(|v| v.get("article_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
 
+        if article_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let articles_query = r#"
+            SELECT author_id
+            FROM article
+            WHERE id IN $article_ids
+        "#;
+
+        let mut response = self.db.query_with_params(articles_query, json!({
+            "article_ids": article_ids
+        })).await?;
+
+        let raw: SurrealValue = response.take(0)?;
+        let results: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
+
+        let mut counts: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
         for result in results {
-            if let (Some(author_id), Some(weight)) = (
-                result.get("author_id").and_then(|v| v.as_str()),
-                result.get("weight").and_then(|v| v.as_f64()),
-            ) {
-                preferences.push(AuthorPreference {
-                    author_id: author_id.to_string(),
-                    weight,
-                });
+            if let Some(author_id) = result.get("author_id").and_then(|v| v.as_str()) {
+                *counts.entry(author_id.to_string()).or_insert(0.0) += 1.0;
             }
         }
+
+        let mut preferences: Vec<AuthorPreference> = counts
+            .into_iter()
+            .map(|(author_id, weight)| AuthorPreference { author_id, weight })
+            .collect();
+
+        preferences.sort_by(|a, b| b.weight.partial_cmp(&a.weight).unwrap_or(std::cmp::Ordering::Equal));
+        preferences.truncate(10);
 
         Ok(preferences)
     }
@@ -380,17 +427,18 @@ impl RecommendationService {
         let tag_ids: Vec<&str> = tag_preferences.iter().map(|t| t.tag_id.as_str()).collect();
 
         let query = r#"
-            SELECT DISTINCT a.*
-            FROM article a
-            JOIN article_tag at ON a.id = at.article_id
-            WHERE at.tag_id IN $tag_ids
-            AND a.status = 'published'
-            AND a.is_deleted = false
-            AND a.author_id != $user_id
-            AND a.id NOT IN (
+            SELECT *
+            FROM article
+            WHERE id IN (
+                SELECT article_id FROM article_tag WHERE tag_id IN $tag_ids
+            )
+            AND status = 'published'
+            AND is_deleted = false
+            AND author_id != $user_id
+            AND id NOT IN (
                 SELECT article_id FROM clap WHERE user_id = $user_id
             )
-            ORDER BY a.clap_count DESC, a.created_at DESC
+            ORDER BY clap_count DESC, created_at DESC
             LIMIT $limit
         "#;
 
@@ -400,7 +448,8 @@ impl RecommendationService {
             "limit": limit
         })).await?;
 
-        let articles: Vec<Article> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let articles: Vec<Article> = surreal_value_to_t_list(raw)?;
         let mut recommendations = Vec::new();
 
         for article in articles {
@@ -443,7 +492,8 @@ impl RecommendationService {
             "limit": limit
         })).await?;
 
-        let articles: Vec<Article> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let articles: Vec<Article> = surreal_value_to_t_list(raw)?;
         let mut recommendations = Vec::new();
 
         for article in articles {
@@ -462,31 +512,49 @@ impl RecommendationService {
     /// 找到相似用户
     async fn find_similar_users(&self, user_id: &str) -> Result<Vec<String>> {
         // 简化的相似性计算：基于共同点赞的文章
-        let query = r#"
-            SELECT c2.user_id, count() as common_claps
-            FROM clap c1
-            JOIN clap c2 ON c1.article_id = c2.article_id
-            WHERE c1.user_id = $user_id
-            AND c2.user_id != $user_id
-            GROUP BY c2.user_id
-            ORDER BY common_claps DESC
-            LIMIT 10
-        "#;
-
-        let mut response = self.db.query_with_params(query, json!({
+        // 先获取当前用户点赞的文章，再在 Rust 中聚合相似用户
+        let clapped_query = "SELECT article_id FROM clap WHERE user_id = $user_id";
+        let mut clap_response = self.db.query_with_params(clapped_query, json!({
             "user_id": user_id
         })).await?;
 
-        let results: Vec<Value> = response.take(0)?;
-        let mut similar_users = Vec::new();
+        let raw: SurrealValue = clap_response.take(0)?;
+        let clapped: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
+        let article_ids: Vec<String> = clapped
+            .iter()
+            .filter_map(|v| v.get("article_id").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
 
+        if article_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let others_query = r#"
+            SELECT user_id FROM clap
+            WHERE article_id IN $article_ids
+            AND user_id != $user_id
+        "#;
+
+        let mut response = self.db.query_with_params(others_query, json!({
+            "article_ids": article_ids,
+            "user_id": user_id
+        })).await?;
+
+        let raw: SurrealValue = response.take(0)?;
+        let results: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
+
+        let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
         for result in results {
             if let Some(uid) = result.get("user_id").and_then(|v| v.as_str()) {
-                similar_users.push(uid.to_string());
+                *counts.entry(uid.to_string()).or_insert(0) += 1;
             }
         }
 
-        Ok(similar_users)
+        let mut similar_users: Vec<(String, i64)> = counts.into_iter().collect();
+        similar_users.sort_by(|a, b| b.1.cmp(&a.1));
+        similar_users.truncate(10);
+
+        Ok(similar_users.into_iter().map(|(uid, _)| uid).collect())
     }
 
     /// 基于相似用户推荐
@@ -502,17 +570,18 @@ impl RecommendationService {
         }
 
         let query = r#"
-            SELECT DISTINCT a.*, count() as popularity
-            FROM article a
-            JOIN clap c ON a.id = c.article_id
-            WHERE c.user_id IN $similar_users
-            AND a.status = 'published'
-            AND a.is_deleted = false
-            AND a.id NOT IN (
+            SELECT *,
+                count((SELECT * FROM clap WHERE article_id = id AND user_id IN $similar_users)) as popularity
+            FROM article
+            WHERE id IN (
+                SELECT article_id FROM clap WHERE user_id IN $similar_users
+            )
+            AND status = 'published'
+            AND is_deleted = false
+            AND id NOT IN (
                 SELECT article_id FROM clap WHERE user_id = $user_id
             )
-            GROUP BY a.id
-            ORDER BY popularity DESC, a.created_at DESC
+            ORDER BY popularity DESC, created_at DESC
             LIMIT $limit
         "#;
 
@@ -522,11 +591,13 @@ impl RecommendationService {
             "limit": limit
         })).await?;
 
-        let articles: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let articles: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
         let mut recommendations = Vec::new();
 
         for article_data in articles.iter() {
-            if let Ok(article) = serde_json::from_value::<Article>(article_data.clone()) {
+            let normalized = normalize_surreal_json(article_data.clone());
+            if let Ok(article) = serde_json::from_value::<Article>(normalized) {
                 let list_item = self.article_to_list_item(&article).await?;
 
                 let popularity = article_data.get("popularity")
@@ -576,12 +647,24 @@ impl RecommendationService {
             id: Uuid::new_v4().to_string(),
             user_id: user_id.to_string(),
             article_id: article_id.to_string(),
-            interaction_type: interaction_type.clone(),
+            interaction_type: interaction_type.as_str().to_string(),
             weight: interaction_type.default_weight(),
             created_at: Utc::now(),
         };
 
-        self.db.create("user_interaction", interaction).await?;
+        let interaction_json = json!({
+            "id": interaction.id,
+            "user_id": interaction.user_id,
+            "article_id": interaction.article_id,
+            "interaction_type": interaction.interaction_type,
+            "weight": interaction.weight,
+            "created_at": interaction.created_at,
+        });
+
+        self.db.query_with_params(
+            "CREATE user_interaction CONTENT $data RETURN *",
+            json!({ "data": interaction_json })
+        ).await?;
         Ok(())
     }
 
@@ -589,14 +672,20 @@ impl RecommendationService {
     pub async fn update_recommendations(&self) -> Result<()> {
         info!("Starting recommendation system update");
 
-        // 更新热门文章缓存
-        self.update_trending_cache().await?;
+        // 更新热门文章缓存（失败时不阻塞推荐系统）
+        if let Err(e) = self.update_trending_cache().await {
+            warn!("update_trending_cache failed: {}", e);
+        }
 
-        // 计算用户画像
-        self.update_user_profiles().await?;
+        // 计算用户画像（失败时不阻塞推荐系统）
+        if let Err(e) = self.update_user_profiles().await {
+            warn!("update_user_profiles failed: {}", e);
+        }
 
-        // 预计算推荐结果（对活跃用户）
-        self.precompute_recommendations().await?;
+        // 预计算推荐结果（对活跃用户，失败时不阻塞推荐系统）
+        if let Err(e) = self.precompute_recommendations().await {
+            warn!("precompute_recommendations failed: {}", e);
+        }
 
         info!("Recommendation system update completed");
         Ok(())
@@ -625,17 +714,19 @@ impl RecommendationService {
             ORDER BY trending_score DESC
         "#;
 
-        let week_ago = Utc::now() - Duration::days(7);
-        let mut response = self.db.query_with_params(query, json!({
-            "week_ago": week_ago
-        })).await?;
-
-        let trending_metrics: Vec<Value> = response.take(0)?;
+        let week_ago = (Utc::now() - Duration::days(7)).to_rfc3339();
+        let query = query.replace("$week_ago", &format!("d'{}'", week_ago));
+        let mut response = self.db.query(&query).await?;
+        let raw: SurrealValue = response.take(0)?;
+        let trending_metrics: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
 
         // 清理旧的趋势数据
-        self.db.query_with_params("DELETE trending_metrics WHERE calculated_at < $yesterday", json!({
-            "yesterday": Utc::now() - Duration::days(1)
-        })).await?;
+        let yesterday = (Utc::now() - Duration::days(1)).to_rfc3339();
+        let delete_query = format!(
+            "DELETE trending_metrics WHERE calculated_at < d'{}'",
+            yesterday
+        );
+        self.db.query(&delete_query).await?;
 
         // 插入新的趋势数据
         for metric in trending_metrics {
@@ -652,7 +743,25 @@ impl RecommendationService {
                     calculated_at: Utc::now(),
                 };
 
-                self.db.create("trending_metrics", trending_metric).await?;
+                let trending_json = json!({
+                    "article_id": trending_metric.article_id,
+                    "views_24h": trending_metric.views_24h,
+                    "views_7d": trending_metric.views_7d,
+                    "claps_24h": trending_metric.claps_24h,
+                    "claps_7d": trending_metric.claps_7d,
+                    "comments_24h": trending_metric.comments_24h,
+                    "comments_7d": trending_metric.comments_7d,
+                    "trending_score": trending_metric.trending_score,
+                    "calculated_at": trending_metric.calculated_at.to_rfc3339(),
+                });
+
+                let json_str = serde_json::to_string(&trending_json)
+                    .map_err(|e| AppError::Internal(e.to_string()))?;
+                let create_query = format!(
+                    "CREATE trending_metrics CONTENT {} RETURN *",
+                    json_str
+                );
+                self.db.query(&create_query).await?;
             }
         }
 
@@ -673,7 +782,8 @@ impl RecommendationService {
             "week_ago": Utc::now() - Duration::days(7)
         })).await?;
 
-        let user_ids: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let user_ids: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
 
         for user_data in user_ids {
             if let Some(user_id) = user_data.get("user_id").and_then(|v| v.as_str()) {
@@ -702,7 +812,8 @@ impl RecommendationService {
             "user_id": user_id
         })).await?;
 
-        let avg_time_result: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let avg_time_result: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
         let avg_reading_time = avg_time_result.first()
             .and_then(|v| v.get("avg_time"))
             .and_then(|v| v.as_f64())
@@ -719,7 +830,8 @@ impl RecommendationService {
             "user_id": user_id
         })).await?;
 
-        let total_result: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let total_result: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
         let total_interactions = total_result.first()
             .and_then(|v| v.get("total"))
             .and_then(|v| v.as_i64())
@@ -741,7 +853,19 @@ impl RecommendationService {
         })).await?;
 
         // 创建新的用户画像
-        self.db.create("user_profile_recommendation", profile).await?;
+        let profile_json = json!({
+            "user_id": profile.user_id,
+            "preferred_tags": profile.preferred_tags,
+            "preferred_authors": profile.preferred_authors,
+            "avg_reading_time": profile.avg_reading_time,
+            "total_interactions": profile.total_interactions,
+            "last_updated": profile.last_updated,
+        });
+
+        self.db.query_with_params(
+            "CREATE user_profile_recommendation CONTENT $data RETURN *",
+            json!({ "data": profile_json })
+        ).await?;
 
         Ok(())
     }
@@ -762,7 +886,8 @@ impl RecommendationService {
             "week_ago": Utc::now() - Duration::days(7)
         })).await?;
 
-        let active_users: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let active_users: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
 
         for user_data in active_users {
             if let Some(user_id) = user_data.get("user_id").and_then(|v| v.as_str()) {
@@ -819,11 +944,13 @@ impl RecommendationService {
             "limit": limit
         })).await?;
 
-        let articles: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let articles: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
         let mut recommendations = Vec::new();
 
         for article_data in articles.iter() {
-            if let Ok(related_article) = serde_json::from_value::<Article>(article_data.clone()) {
+            let normalized = normalize_surreal_json(article_data.clone());
+            if let Ok(related_article) = serde_json::from_value::<Article>(normalized) {
                 let list_item = self.article_to_list_item(&related_article).await?;
 
                 let common_tags = article_data.get("common_tags")
@@ -854,7 +981,8 @@ impl RecommendationService {
             "author_id": &article.author_id
         })).await?;
         
-        let author_data: Vec<Value> = author_response.take(0)?;
+        let author_raw: SurrealValue = author_response.take(0)?;
+        let author_data: Vec<JsonValue> = surreal_value_to_json_list(author_raw)?;
         let author_info = if let Some(author) = author_data.first() {
             AuthorInfo {
                 id: author["id"].as_str().unwrap_or("").to_string(),
@@ -885,7 +1013,8 @@ impl RecommendationService {
                 "publication_id": pub_id
             })).await?;
             
-            let pub_data: Vec<Value> = pub_response.take(0)?;
+            let pub_raw: SurrealValue = pub_response.take(0)?;
+            let pub_data: Vec<JsonValue> = surreal_value_to_json_list(pub_raw)?;
             pub_data.first().map(|p| PublicationInfo {
                 id: p["id"].as_str().unwrap_or("").to_string(),
                 name: p["name"].as_str().unwrap_or("").to_string(),
@@ -903,14 +1032,16 @@ impl RecommendationService {
             "article_id": &article.id
         })).await?;
         
-        let tag_relations: Vec<Value> = tag_rel_response.take(0)?;
+        let tag_rel_raw: SurrealValue = tag_rel_response.take(0)?;
+        let tag_relations: Vec<JsonValue> = surreal_value_to_json_list(tag_rel_raw)?;
         let mut tags: Vec<TagInfo> = Vec::new();
         
         for rel in tag_relations {
             if let Some(tag_id) = rel.get("tag_id").and_then(|v| v.as_str()) {
                 // 获取tag详情
                 if let Ok(mut tag_response) = self.db.query(&format!("SELECT * FROM {}", tag_id)).await {
-                    if let Ok(tag_values) = tag_response.take::<Vec<Value>>(0) {
+                    if let Ok(tag_raw) = tag_response.take::<SurrealValue>(0) {
+                        let tag_values = surreal_value_to_json_list(tag_raw)?;
                         if let Some(tag_value) = tag_values.first() {
                             tags.push(TagInfo {
                                 id: tag_value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),

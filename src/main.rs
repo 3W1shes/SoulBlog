@@ -1,10 +1,13 @@
 use std::sync::Arc;
 use axum::{
+    extract::{Query, State},
+    response::Html,
     routing::{Router, get, post},
     Extension,
     http::{Method, HeaderValue},
     middleware,
 };
+use serde::Deserialize;
 use tower_http::{
     cors::{CorsLayer, Any},
     compression::CompressionLayer,
@@ -211,6 +214,7 @@ async fn main() -> anyhow::Result<()> {
         
         // Health check endpoints (no domain context needed)
         .route("/health", get(health_check))
+        .route("/sso", get(sso_bridge))
         
         // Domain-specific routes (work with custom domains and subdomains)
         // These routes are merged at the root level and rely on domain routing middleware
@@ -229,7 +233,7 @@ async fn main() -> anyhow::Result<()> {
         ))
         
         // Debug middleware to log requests
-        .layer(middleware::from_fn(|req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next<axum::body::Body>| async move {
+        .layer(middleware::from_fn(|req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| async move {
             let path = req.uri().path().to_string();
             let method = req.method().clone();
             tracing::info!("Incoming request (before auth): {} {}", method, path);
@@ -280,15 +284,60 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", config.server_host, config.server_port);
     info!("Starting server on http://{}", addr);
 
-    axum::Server::bind(&addr.parse()?)
-        .serve(app.into_make_service())
-        .await?;
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
 
     Ok(())
 }
 
 async fn health_check() -> &'static str {
     "Rainbow-Blog is running!"
+}
+
+#[derive(Deserialize)]
+struct SsoParams {
+    token: Option<String>,
+    next: Option<String>,
+}
+
+async fn sso_bridge(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SsoParams>,
+) -> Html<String> {
+    let token = params.token.unwrap_or_default();
+    if token.trim().is_empty() {
+        return Html("missing token".to_string());
+    }
+    let next = params
+        .next
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| state.config.frontend_url.clone());
+    let token_js = serde_json::to_string(&token).unwrap_or_else(|_| "\"\"".into());
+    let next_js = serde_json::to_string(&next).unwrap_or_else(|_| "\"/\"".into());
+    let html = format!(
+        r#"<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>SSO Redirect</title>
+  </head>
+  <body>
+    <script>
+      const token = {token_js};
+      const next = {next_js};
+      try {{
+        localStorage.setItem('jwt_token', token);
+        localStorage.setItem('auth_token', token);
+        localStorage.setItem('token', token);
+      }} catch (e) {{
+        // ignore storage errors
+      }}
+      window.location.replace(next);
+    </script>
+  </body>
+</html>"#
+    );
+    Html(html)
 }
 
 async fn auto_start_database(config: &Config) -> anyhow::Result<()> {

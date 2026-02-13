@@ -30,7 +30,7 @@ pub async fn auth_middleware(
     State(app_state): State<Arc<AppState>>,
     headers: HeaderMap,
     mut request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<Response, AppError> {
     let path = request.uri().path();
     info!("Auth middleware processing request to: {}", path);
@@ -94,7 +94,7 @@ pub async fn auth_middleware(
 pub async fn rate_limit_middleware(
     State(app_state): State<Arc<AppState>>,
     mut request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<Response, AppError> {
     // 获取或创建速率限制器
     let rate_limiter = RATE_LIMITER.get_or_init(|| async {
@@ -122,7 +122,7 @@ pub async fn rate_limit_middleware(
 /// 请求日志中间件
 pub async fn request_logging_middleware(
     request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
@@ -151,7 +151,7 @@ pub async fn request_logging_middleware(
 /// CORS 中间件（如果需要自定义逻辑）
 pub async fn cors_middleware(
     request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Response {
     let origin = request
         .headers()
@@ -175,7 +175,7 @@ pub async fn cors_middleware(
 /// 安全头中间件
 pub async fn security_headers_middleware(
     request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Response {
     let is_https = is_https_request(&request);
     let mut response = next.run(request).await;
@@ -201,7 +201,7 @@ pub async fn security_headers_middleware(
 /// 请求 ID 中间件
 pub async fn request_id_middleware(
     mut request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Response {
     let request_id = uuid::Uuid::new_v4().to_string();
     
@@ -219,7 +219,7 @@ pub async fn request_id_middleware(
 /// 健康检查绕过中间件
 pub async fn health_check_bypass_middleware(
     request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Response {
     // 健康检查端点绕过某些中间件
     if request.uri().path() == "/health" || request.uri().path() == "/" {
@@ -321,7 +321,7 @@ pub async fn domain_routing_middleware(
     State(app_state): State<Arc<AppState>>,
     headers: HeaderMap,
     mut request: Request<Body>,
-    next: Next<Body>,
+    next: Next,
 ) -> Result<Response, AppError> {
     // Extract the host header
     if let Some(host_header) = headers.get("host") {
@@ -422,4 +422,3 @@ where
         Ok(OptionalAuth(user))
     }
 }
-

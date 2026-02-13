@@ -168,10 +168,7 @@ impl UserProfile {
     pub fn new(user_id: String, username: String, display_name: String) -> Self {
         let now = Utc::now();
         Self {
-            id: Thing {
-                tb: "user_profile".to_string(),
-                id: surrealdb::sql::Id::String(Uuid::new_v4().to_string()),
-            },
+            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
             user_id,
             username,
             display_name,
@@ -233,10 +230,7 @@ impl From<CreateUserProfileRequest> for UserProfile {
     fn from(req: CreateUserProfileRequest) -> Self {
         let now = Utc::now();
         Self {
-            id: Thing {
-                tb: "user_profile".to_string(),
-                id: surrealdb::sql::Id::String(Uuid::new_v4().to_string()),
-            },
+            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
             user_id: String::new(), // 将在服务层设置
             username: req.username,
             display_name: req.display_name,

@@ -75,10 +75,7 @@ impl MediaService {
 
         // 创建数据库记录
         let media_file = MediaFile {
-            id: surrealdb::sql::Thing {
-                tb: "media_file".to_string(),
-                id: surrealdb::sql::Id::String(file_id.clone()),
-            },
+            id: surrealdb::sql::Thing::from(("media_file".to_string(), file_id.clone())),
             user_id: user_id.to_string(),
             filename: stored_filename.clone(),
             original_filename: filename.to_string(),

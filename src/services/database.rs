@@ -81,6 +81,8 @@ impl Database {
     where
         P: Serialize,
     {
+        let params = serde_json::to_value(params)
+            .map_err(|e| AppError::Internal(e.to_string()))?;
         self.storage.query_with_params(sql, params)
             .await
             .map_err(|e| AppError::from(e))
@@ -89,7 +91,7 @@ impl Database {
     /// 创建记录
     pub async fn create<T>(&self, table: &str, data: T) -> Result<T>
     where
-        T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + Debug,
+        T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Clone + Debug + 'static,
     {
         // 使用 storage 的原生 create 方法
         let results = self.storage.create(table, data)
@@ -113,7 +115,7 @@ impl Database {
     /// 更新记录
     pub async fn update<T>(&self, thing: Thing, data: T) -> Result<Option<T>>
     where
-        T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Debug,
+        T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Debug + 'static,
     {
         self.storage.update(thing, data)
             .await
@@ -161,7 +163,7 @@ impl Database {
     /// 通过ID更新记录
     pub async fn update_by_id<T>(&self, table: &str, id: &str, data: T) -> Result<Option<T>>
     where
-        T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Debug,
+        T: Serialize + for<'de> Deserialize<'de> + Send + Sync + Debug + 'static,
     {
         let prefix = format!("{}:", table);
         let pure_id = if id.starts_with(&prefix) { &id[prefix.len()..] } else { id };

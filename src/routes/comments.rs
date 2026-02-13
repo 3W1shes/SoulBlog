@@ -23,7 +23,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/:id", delete(delete_comment))
         .route("/:id/clap", post(clap_comment))
         .route("/:id/clap", delete(remove_clap))
-        .layer(axum::middleware::from_fn(|req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next<axum::body::Body>| async move {
+        .layer(axum::middleware::from_fn(|req: axum::http::Request<axum::body::Body>, next: axum::middleware::Next| async move {
             tracing::info!("Comments router: {} {}", req.method(), req.uri().path());
             next.run(req).await
         }))

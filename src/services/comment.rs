@@ -3,12 +3,14 @@ use crate::{
     models::comment::*,
     models::article::Article,
     services::Database,
+    services::article::normalize_surreal_json,
 };
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::collections::HashMap;
 use surrealdb::sql::Thing;
+use surrealdb::Value as SurrealValue;
 use tracing::{debug, error, info};
 use validator::Validate;
 use uuid::Uuid;
@@ -53,11 +55,7 @@ impl CommentService {
             .map_err(|e| AppError::ValidatorError(e))?;
 
         // Verify article exists and is published
-        let article: Article = self
-            .db
-            .get_by_id("article", &request.article_id)
-            .await?
-            .ok_or_else(|| AppError::NotFound("Article not found".to_string()))?;
+        let article = self.get_article_for_comment(&request.article_id).await?;
 
         if article.status != crate::models::article::ArticleStatus::Published {
             return Err(AppError::forbidden(
@@ -94,7 +92,7 @@ impl CommentService {
             .unwrap_or_else(|| String::new());
             
         let query = format!(
-            "CREATE comment:`{}` SET article_id = '{}', author_id = '{}'{}, content = '{}', is_author_response = {}, clap_count = 0, is_edited = false, is_deleted = false",
+            "CREATE comment:`{}` SET article_id = '{}', author_id = '{}'{}, content = '{}', is_author_response = {}, clap_count = 0, is_edited = false, is_deleted = false, deleted_at = NONE, created_at = time::now(), updated_at = time::now()",
             comment_id,
             request.article_id,
             user_id,
@@ -107,13 +105,22 @@ impl CommentService {
         
         // 执行 CREATE 语句
         let mut response = self.db.storage.query(&query).await?;
-        
-        // SurrealDB 返回的是一个数组，即使只有一条记录
-        let results: Vec<serde_json::Value> = response.take(0)?;
+
+        // SurrealDB 返回的是 Value（可能包含 Thing/Array/Object 等）
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)
+            .map_err(|e| AppError::Serialization(e))?;
+        let list_json = normalize_surreal_json(raw_json);
+
+        // 规范化后应为数组
+        let results: Vec<serde_json::Value> = serde_json::from_value(list_json)
+            .map_err(|e| AppError::Serialization(e))?;
         debug!("Query results: {:?}", results);
-        
+
         // 从数组中取出第一个元素
-        let mut created_value = results.into_iter().next()
+        let mut created_value = results
+            .into_iter()
+            .next()
             .ok_or_else(|| AppError::Internal("Failed to create comment - no results returned".to_string()))?;
             
         // 处理 SurrealDB 的 Thing 格式的 ID
@@ -125,6 +132,14 @@ impl CommentService {
                 }
             }
         }
+
+        // 兜底：如果数据库未返回 created_at/updated_at，则补上当前时间
+        if created_value.get("created_at").is_none() {
+            created_value["created_at"] = json!(Utc::now());
+        }
+        if created_value.get("updated_at").is_none() {
+            created_value["updated_at"] = json!(Utc::now());
+        }
         
         debug!("Processed comment value: {:?}", created_value);
             
@@ -135,6 +150,25 @@ impl CommentService {
         self.update_article_comment_count(&request.article_id).await?;
 
         Ok(created)
+    }
+
+    async fn get_article_for_comment(&self, article_id: &str) -> Result<Article> {
+        let pure_id = normalize_record_id(article_id, "article");
+        let query = format!("SELECT * FROM article:`{}`", pure_id);
+        debug!("Executing query: {}", query);
+
+        let mut response = self.db.storage.query(&query).await?;
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)
+            .map_err(|e| AppError::Serialization(e))?;
+        let list_json = normalize_surreal_json(raw_json);
+        let mut articles: Vec<Article> = serde_json::from_value(list_json)
+            .map_err(|e| AppError::Serialization(e))?;
+
+        articles
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::NotFound("Article not found".to_string()))
     }
 
     pub async fn get_comment(&self, comment_id: &str) -> Result<Option<Comment>> {
@@ -166,10 +200,17 @@ impl CommentService {
         let mut response = self.db.query_with_params(query, json!({
             "article_id": article_id
         })).await?;
-        
-        // Get raw JSON values first
-        let raw_comments: Vec<serde_json::Value> = response.take(0)?;
-        
+
+        // SurrealDB 返回 Value，先做规范化再解析
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)
+            .map_err(|e| AppError::Serialization(e))?;
+        let list_json = normalize_surreal_json(raw_json);
+        let raw_comments: Vec<serde_json::Value> = match list_json {
+            Value::Array(arr) => arr,
+            other => vec![other],
+        };
+
         info!("Got {} raw comments from database", raw_comments.len());
         
         // Process each comment to fix the ID format
@@ -510,7 +551,7 @@ impl CommentService {
 
         // 使用反引号包裹 ID（与 article.rs 保持一致）
         let query = format!(r#"
-            LET $count = (SELECT count() FROM comment WHERE article_id = $article_id AND is_deleted = false);
+            LET $count = count((SELECT * FROM comment WHERE article_id = $article_id AND is_deleted = false));
             UPDATE article:`{}` SET comment_count = $count;
         "#, pure_id);
 
@@ -533,6 +574,15 @@ impl CommentService {
 
         Ok(())
     }
+}
+
+fn normalize_record_id(id: &str, table: &str) -> String {
+    let trimmed = id.trim();
+    let without_prefix = trimmed
+        .strip_prefix(&format!("{}:", table))
+        .unwrap_or(trimmed);
+    let cleaned = without_prefix.replace('⟨', "").replace('⟩', "");
+    cleaned.trim_matches('"').to_string()
 }
 
 // Helper: recursively sort replies by created_at desc

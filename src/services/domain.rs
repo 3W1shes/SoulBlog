@@ -212,10 +212,10 @@ impl DomainService {
             }
             
             // Update verification record
-            let thing = soulcore::prelude::Thing {
-                tb: "domain_verification_record".to_string(),
-                id: surrealdb::sql::Id::String(record.id.to_string()),
-            };
+            let thing = soulcore::prelude::Thing::from((
+                "domain_verification_record".to_string(),
+                record.id.to_string(),
+            ));
             self.db.update(thing, record.clone()).await?;
             updated_records.push(record);
         }

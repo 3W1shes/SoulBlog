@@ -37,6 +37,7 @@ pub struct Article {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seo_description: Option<String>,
     pub seo_keywords: Vec<String>,
+    #[serde(default)]
     pub metadata: serde_json::Value,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,

@@ -5,12 +5,14 @@ use crate::{
     utils::{markdown::MarkdownProcessor, slug},
 };
 use chrono::Utc;
-use serde_json::{json, Value};
+use serde_json::{json, Value as JsonValue};
 use tracing::{info, warn, error, debug};
 use validator::Validate;
 use std::collections::HashMap;
 use std::sync::Arc;
+use serde::de::DeserializeOwned;
 use soulcore::prelude::Thing;
+use surrealdb::Value as SurrealValue;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -65,6 +67,219 @@ fn normalize_surreal_id(id: &str) -> String {
     }
 
     cleaned.trim_matches('"').to_string()
+}
+
+pub(crate) fn normalize_surreal_json(value: JsonValue) -> JsonValue {
+    match value {
+        JsonValue::Object(mut map) => {
+            if let Some(v) = map.remove("Strand") {
+                return normalize_surreal_json(v);
+            }
+            if let Some(v) = map.remove("String") {
+                return normalize_surreal_json(v);
+            }
+            if let Some(v) = map.remove("Bool") {
+                return normalize_surreal_json(v);
+            }
+            if let Some(v) = map.remove("Array") {
+                return normalize_surreal_json(v);
+            }
+            if map.remove("None").is_some() {
+                return JsonValue::Null;
+            }
+            if map.remove("Null").is_some() {
+                return JsonValue::Null;
+            }
+            if let Some(v) = map.remove("Some") {
+                return normalize_surreal_json(v);
+            }
+            if map.len() == 1 {
+                if let Some(v) = map.remove("value") {
+                    return normalize_surreal_json(v);
+                }
+            }
+            if let Some(v) = map.remove("Datetime") {
+                return normalize_surreal_json(v);
+            }
+            if let Some(v) = map.remove("DateTime") {
+                return normalize_surreal_json(v);
+            }
+            if let Some(v) = map.remove("Uuid") {
+                return normalize_surreal_json(v);
+            }
+            if let Some(v) = map.remove("Object") {
+                return normalize_surreal_json(v);
+            }
+            if let Some(v) = map.remove("Number") {
+                if let JsonValue::Object(mut num) = v {
+                    if let Some(i) = num.remove("Int") {
+                        return normalize_surreal_json(i);
+                    }
+                    if let Some(f) = num.remove("Float") {
+                        return normalize_surreal_json(f);
+                    }
+                    if let Some(d) = num.remove("Decimal") {
+                        return normalize_surreal_json(d);
+                    }
+                }
+                return JsonValue::Null;
+            }
+            if let Some(v) = map.remove("Thing") {
+                if let JsonValue::Object(mut thing) = v {
+                    let tb = thing.remove("tb").and_then(|v| v.as_str().map(|s| s.to_string()));
+                    let id_val = thing.remove("id");
+                    if let (Some(tb), Some(id_val)) = (tb, id_val) {
+                        let id_str = match normalize_surreal_json(id_val) {
+                            JsonValue::String(s) => s,
+                            other => other.to_string(),
+                        };
+                        return JsonValue::String(format!("{}:{}", tb, id_str));
+                    }
+                }
+            }
+            let normalized = map
+                .into_iter()
+                .map(|(k, v)| (k, normalize_surreal_json(v)))
+                .collect::<serde_json::Map<String, JsonValue>>();
+            JsonValue::Object(normalized)
+        }
+        JsonValue::Array(arr) => {
+            JsonValue::Array(arr.into_iter().map(normalize_surreal_json).collect())
+        }
+        other => other,
+    }
+}
+
+fn surreal_to_json(value: SurrealValue) -> Option<JsonValue> {
+    match serde_json::to_value(value) {
+        Ok(v) => Some(normalize_surreal_json(v)),
+        Err(err) => {
+            warn!("Failed to convert Surreal value to JSON: {}", err);
+            None
+        }
+    }
+}
+
+fn parse_articles_from_value_list(values: Vec<JsonValue>) -> Result<Vec<Article>> {
+    let mut articles = Vec::new();
+    for value in values {
+        let normalized = normalize_surreal_json(value);
+        let normalized = coerce_article_numeric_fields(normalized);
+        match serde_json::from_value::<Article>(normalized) {
+            Ok(article) => articles.push(article),
+            Err(err) => {
+                warn!("Skipping article due to deserialization error: {}", err);
+            }
+        }
+    }
+    Ok(articles)
+}
+
+fn coerce_article_numeric_fields(mut value: JsonValue) -> JsonValue {
+    fn coerce_single_number(v: &mut JsonValue) {
+        if let JsonValue::Array(arr) = v {
+            if arr.len() != 1 {
+                return;
+            }
+
+            let first = arr.remove(0);
+            let coerced = match first {
+                JsonValue::Number(_) => Some(first),
+                JsonValue::String(s) => {
+                    if let Ok(int_val) = s.parse::<i64>() {
+                        Some(JsonValue::Number(int_val.into()))
+                    } else if let Ok(float_val) = s.parse::<f64>() {
+                        serde_json::Number::from_f64(float_val).map(JsonValue::Number)
+                    } else {
+                        None
+                    }
+                }
+                JsonValue::Object(mut obj) => {
+                    // Common shapes: {"count": 0} or {"value": 0}
+                    if let Some(v) = obj.remove("count").or_else(|| obj.remove("value")) {
+                        match v {
+                            JsonValue::Number(_) => Some(v),
+                            JsonValue::String(s) => {
+                                if let Ok(int_val) = s.parse::<i64>() {
+                                    Some(JsonValue::Number(int_val.into()))
+                                } else if let Ok(float_val) = s.parse::<f64>() {
+                                    serde_json::Number::from_f64(float_val).map(JsonValue::Number)
+                                } else {
+                                    None
+                                }
+                            }
+                            other => Some(other),
+                        }
+                    } else {
+                        None
+                    }
+                }
+                other => Some(other),
+            };
+
+            if let Some(val) = coerced {
+                *v = val;
+            }
+        }
+    }
+
+    if let JsonValue::Object(map) = &mut value {
+        for key in [
+            "reading_time",
+            "word_count",
+            "view_count",
+            "clap_count",
+            "comment_count",
+            "bookmark_count",
+            "share_count",
+        ] {
+            if let Some(v) = map.get_mut(key) {
+                coerce_single_number(v);
+            }
+        }
+    }
+
+    value
+}
+
+fn parse_from_surreal_list<T: DeserializeOwned>(raw_list: Vec<SurrealValue>) -> Vec<T> {
+    let mut items = Vec::new();
+    for raw in raw_list {
+        if let Some(json_value) = surreal_to_json(raw) {
+            match serde_json::from_value::<T>(json_value) {
+                Ok(item) => items.push(item),
+                Err(err) => {
+                    warn!("Skipping item due to deserialization error: {}", err);
+                }
+            }
+        }
+    }
+    items
+}
+
+fn parse_from_json_list<T: DeserializeOwned>(raw_list: Vec<JsonValue>) -> Vec<T> {
+    let mut items = Vec::new();
+    for raw in raw_list {
+        let normalized = normalize_surreal_json(raw);
+        match serde_json::from_value::<T>(normalized) {
+            Ok(item) => items.push(item),
+            Err(err) => {
+                warn!("Skipping item due to deserialization error: {}", err);
+            }
+        }
+    }
+    items
+}
+
+fn surreal_to_json_list(raw: SurrealValue) -> Vec<JsonValue> {
+    if let Some(json_value) = surreal_to_json(raw) {
+        match json_value {
+            JsonValue::Array(arr) => arr,
+            other => vec![other],
+        }
+    } else {
+        Vec::new()
+    }
 }
 
 impl ArticleService {
@@ -146,91 +361,82 @@ impl ArticleService {
             article.published_at = Some(Utc::now());
         }
 
-        // 构建动态字段列表
-        let mut fields = vec![
-            "title: $title".to_string(),
-            "slug: $slug".to_string(),
-            "content: $content".to_string(),
-            "content_html: $content_html".to_string(),
-            "author_id: $author_id".to_string(),
-            "status: $status".to_string(),
-            "is_paid_content: $is_paid_content".to_string(),
-            "is_featured: $is_featured".to_string(),
-            "reading_time: $reading_time".to_string(),
-            "word_count: $word_count".to_string(),
-            "view_count: 0".to_string(),
-            "clap_count: 0".to_string(),
-            "comment_count: 0".to_string(),
-            "bookmark_count: 0".to_string(),
-            "share_count: 0".to_string(),
-            "seo_keywords: $seo_keywords".to_string(),
-            "metadata: $metadata".to_string(),
-            "created_at: time::now()".to_string(),
-            "updated_at: time::now()".to_string(),
-            "is_deleted: false".to_string(),
-        ];
+        let status_str = match article.status {
+            ArticleStatus::Draft => "draft",
+            ArticleStatus::Published => "published",
+            ArticleStatus::Unlisted => "unlisted",
+            ArticleStatus::Archived => "archived",
+        };
 
-        // 只添加有值的可选字段
-        if article.subtitle.is_some() {
-            fields.push("subtitle: $subtitle".to_string());
+        let mut params_map = serde_json::Map::new();
+        params_map.insert("title".into(), json!(article.title));
+        if let Some(subtitle) = article.subtitle.clone() {
+            params_map.insert("subtitle".into(), json!(subtitle));
         }
-        if article.excerpt.is_some() {
-            fields.push("excerpt: $excerpt".to_string());
+        params_map.insert("slug".into(), json!(article.slug));
+        params_map.insert("content".into(), json!(article.content));
+        params_map.insert("content_html".into(), json!(article.content_html));
+        if let Some(excerpt) = article.excerpt.clone() {
+            params_map.insert("excerpt".into(), json!(excerpt));
         }
-        if article.cover_image_url.is_some() {
-            fields.push("cover_image_url: $cover_image_url".to_string());
+        if let Some(cover) = article.cover_image_url.clone() {
+            params_map.insert("cover_image_url".into(), json!(cover));
         }
-        if article.publication_id.is_some() {
-            fields.push("publication_id: $publication_id".to_string());
+        params_map.insert("author_id".into(), json!(article.author_id));
+        if let Some(publication_id) = article.publication_id.clone() {
+            params_map.insert("publication_id".into(), json!(publication_id));
         }
-        if article.series_id.is_some() {
-            fields.push("series_id: $series_id".to_string());
+        if let Some(series_id) = article.series_id.clone() {
+            params_map.insert("series_id".into(), json!(series_id));
         }
-        if article.series_order.is_some() {
-            fields.push("series_order: $series_order".to_string());
+        if let Some(series_order) = article.series_order {
+            params_map.insert("series_order".into(), json!(series_order));
         }
-        if article.seo_title.is_some() {
-            fields.push("seo_title: $seo_title".to_string());
+        params_map.insert("status".into(), json!(status_str));
+        params_map.insert("is_paid_content".into(), json!(article.is_paid_content));
+        params_map.insert("is_featured".into(), json!(article.is_featured));
+        params_map.insert("reading_time".into(), json!(article.reading_time));
+        params_map.insert("word_count".into(), json!(article.word_count));
+        params_map.insert("view_count".into(), json!(0));
+        params_map.insert("clap_count".into(), json!(0));
+        params_map.insert("comment_count".into(), json!(0));
+        params_map.insert("bookmark_count".into(), json!(0));
+        params_map.insert("share_count".into(), json!(0));
+        if let Some(seo_title) = article.seo_title.clone() {
+            params_map.insert("seo_title".into(), json!(seo_title));
         }
-        if article.seo_description.is_some() {
-            fields.push("seo_description: $seo_description".to_string());
+        if let Some(seo_description) = article.seo_description.clone() {
+            params_map.insert("seo_description".into(), json!(seo_description));
         }
+        params_map.insert("seo_keywords".into(), json!(article.seo_keywords));
         if article.status == ArticleStatus::Published {
-            fields.push("published_at: time::now()".to_string());
+            params_map.insert("published_at".into(), json!(Utc::now()));
+        }
+        params_map.insert("created_at".into(), json!(Utc::now()));
+        params_map.insert("updated_at".into(), json!(Utc::now()));
+        params_map.insert("is_deleted".into(), json!(false));
+        if let Some(obj) = article.metadata.as_object() {
+            if !obj.is_empty() {
+                params_map.insert("metadata".into(), json!(article.metadata));
+            }
         }
 
-        // 使用具体的记录 ID 创建
+        let content_json = serde_json::Value::Object(params_map);
+        let content_str = serde_json::to_string(&content_json)
+            .map_err(|e| AppError::Serialization(e))?;
         let query = format!(
-            "CREATE article:`{}` CONTENT {{ {} }} RETURN *",
+            "CREATE article:`{}` CONTENT {} RETURN *",
             article.id,
-            fields.join(", ")
+            content_str
         );
-        
-        let params = json!({
-            "title": article.title,
-            "subtitle": article.subtitle,
-            "slug": article.slug,
-            "content": article.content,
-            "content_html": article.content_html,
-            "excerpt": article.excerpt,
-            "cover_image_url": article.cover_image_url,
-            "author_id": article.author_id,
-            "publication_id": article.publication_id,
-            "series_id": article.series_id,
-            "series_order": article.series_order,
-            "status": serde_json::to_value(&article.status)?,
-            "is_paid_content": article.is_paid_content,
-            "is_featured": article.is_featured,
-            "reading_time": article.reading_time,
-            "word_count": article.word_count,
-            "seo_title": article.seo_title,
-            "seo_description": article.seo_description,
-            "seo_keywords": article.seo_keywords,
-            "metadata": article.metadata
-        });
-        
-        let mut response = self.db.query_with_params(&query, params).await?;
-        let created_articles: Vec<Article> = response.take(0)?;
+        debug!("Executing create query: {}", query);
+
+        let mut response = self.db.query(&query).await?;
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)?;
+        debug!("Create article raw response: {}", raw_json);
+        let list_json = normalize_surreal_json(raw_json);
+        let created_articles: Vec<Article> = serde_json::from_value(list_json)?;
         let created_article = created_articles.into_iter().next()
             .ok_or_else(|| AppError::Internal("Failed to create article".to_string()))?;
 
@@ -338,10 +544,7 @@ impl ArticleService {
         }
 
         // 更新文章
-        let thing = Thing {
-            tb: "article".to_string(),
-            id: surrealdb::sql::Id::String(article_id.to_string()),
-        };
+        let thing = Thing::from(("article".to_string(), article_id.to_string()));
         let updated_article = self.db.update(thing, article).await?
             .ok_or_else(|| AppError::NotFound("Failed to update article".to_string()))?;
 
@@ -391,10 +594,16 @@ impl ArticleService {
         // 使用反引号包裹 ID 以避免解析问题
         let query = format!("SELECT * FROM article:`{}`", pure_id);
         debug!("Executing query: {}", query);
-        
+
         let mut response = self.db.query(&query).await?;
-        
-        let articles: Vec<Article> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)?;
+        let list_json = normalize_surreal_json(raw_json);
+        let list = match list_json {
+            JsonValue::Array(arr) => arr,
+            other => vec![other],
+        };
+        let articles = parse_articles_from_value_list(list)?;
         debug!("Found {} articles", articles.len());
         Ok(articles.into_iter().next())
     }
@@ -402,8 +611,20 @@ impl ArticleService {
     /// 根据 slug 获取文章
     pub async fn get_article_by_slug(&self, slug: &str) -> Result<Option<Article>> {
         debug!("Getting article by slug: {}", slug);
-
-        self.db.find_one("article", "slug", slug).await
+        let slug_json = serde_json::to_string(slug)
+            .map_err(|e| AppError::Internal(format!("Failed to encode slug: {}", e)))?;
+        let query = format!("SELECT * FROM article WHERE slug = {}", slug_json);
+        debug!("Executing query: {}", query);
+        let mut response = self.db.query(&query).await?;
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)?;
+        let list_json = normalize_surreal_json(raw_json);
+        let list = match list_json {
+            JsonValue::Array(arr) => arr,
+            other => vec![other],
+        };
+        let articles = parse_articles_from_value_list(list)?;
+        Ok(articles.into_iter().next())
     }
 
     /// 获取文章完整信息（包含作者、标签、统计等）
@@ -565,12 +786,28 @@ impl ArticleService {
 
         // 执行查询
         let mut count_response = self.db.query_with_params(&count_query, &params).await?;
-        let total = if let Ok(Some(result)) = count_response.take::<Option<Value>>(0) {
+        let total = if let Ok(Some(result)) = count_response.take::<Option<JsonValue>>(0) {
             result.get("total").and_then(|v| v.as_i64()).unwrap_or(0) as usize
         } else { 0 };
 
         let mut data_response = self.db.query_with_params(&data_query, params).await?;
-        let articles: Vec<Article> = data_response.take(0)?;
+        let raw: SurrealValue = data_response.take(0)?;
+        let raw_list = surreal_to_json_list(raw);
+        debug!(
+            "Raw articles response (count={}): {}",
+            raw_list.len(),
+            serde_json::to_string(&raw_list).unwrap_or_else(|_| "<unserializable>".to_string())
+        );
+        let normalized_items: Vec<JsonValue> = raw_list
+            .into_iter()
+            .map(normalize_surreal_json)
+            .collect();
+        debug!(
+            "Normalized articles response (count={}): {}",
+            normalized_items.len(),
+            serde_json::to_string(&normalized_items).unwrap_or_else(|_| "<unserializable>".to_string())
+        );
+        let articles = parse_articles_from_value_list(normalized_items)?;
         
         // 将Article转换为ArticleListItem，并填充作者信息
         let mut article_list_items = Vec::new();
@@ -638,7 +875,7 @@ impl ArticleService {
         debug!("Updating comment count for article: {}", article_id);
 
         let query = r#"
-            LET $count = (SELECT count() FROM comment WHERE article_id = $id AND is_deleted = false);
+            LET $count = count((SELECT * FROM comment WHERE article_id = $id AND is_deleted = false));
             UPDATE article SET comment_count = $count, updated_at = $now WHERE id = $id;
         "#;
         
@@ -656,7 +893,7 @@ impl ArticleService {
         let mut slug = base_slug.clone();
         let mut counter = 1;
 
-        while self.get_article_by_slug(&slug).await?.is_some() {
+        while self.slug_exists(&slug).await? {
             slug = format!("{}-{}", base_slug, counter);
             counter += 1;
             
@@ -666,6 +903,13 @@ impl ArticleService {
         }
 
         Ok(slug)
+    }
+
+    async fn slug_exists(&self, slug: &str) -> Result<bool> {
+        let query = "SELECT VALUE count() FROM article WHERE slug = $slug";
+        let mut response = self.db.query_with_params(query, json!({ "slug": slug })).await?;
+        let counts: Vec<i64> = response.take(0)?;
+        Ok(counts.into_iter().next().unwrap_or(0) > 0)
     }
 
     /// 为文章附加标签
@@ -746,18 +990,18 @@ impl ArticleService {
         debug!("Getting or creating tag with name: {}, slug: {}", tag_name, slug);
         
         // 查找现有标签
-        if let Some(tag) = self.db.find_one::<Value>("tag", "slug", &slug).await? {
+        if let Some(tag) = self.db.find_one::<JsonValue>("tag", "slug", &slug).await? {
             debug!("Found existing tag: {:?}", tag);
             if let Some(id_value) = tag.get("id") {
                 match id_value {
-                    Value::String(s) => return Ok(s.clone()),
-                    Value::Object(obj) => {
+                    JsonValue::String(s) => return Ok(s.clone()),
+                    JsonValue::Object(obj) => {
                         // 处理 Thing 格式 { "tb": "tag", "id": { "String": "xxx" } }
                         if let (Some(tb), Some(id)) = (obj.get("tb"), obj.get("id")) {
                             let tb_str = tb.as_str().unwrap_or("tag");
                             let id_str = match id {
-                                Value::String(s) => s.clone(),
-                                Value::Object(id_obj) => {
+                                JsonValue::String(s) => s.clone(),
+                                JsonValue::Object(id_obj) => {
                                     id_obj.get("String")
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("unknown")
@@ -803,7 +1047,7 @@ impl ArticleService {
         ).await?;
 
         let mut response = result;
-        match response.take::<Option<Value>>(0) {
+        match response.take::<Option<JsonValue>>(0) {
             Ok(Some(created)) => {
                 debug!("Tag created successfully: {:?}", created);
                 // 我们已经使用了完整的 tag:uuid 格式作为 ID
@@ -853,8 +1097,11 @@ impl ArticleService {
         let mut response = self.db.query_with_params(&update_query, json!({
             "status": "published"
         })).await?;
-        
-        let updated_articles: Vec<Article> = response.take(0)?;
+
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)?;
+        let list_json = normalize_surreal_json(raw_json);
+        let updated_articles: Vec<Article> = serde_json::from_value(list_json)?;
         let updated_article = updated_articles.into_iter().next()
             .ok_or_else(|| AppError::NotFound("Failed to publish article".to_string()))?;
         
@@ -895,8 +1142,11 @@ impl ArticleService {
         let mut response = self.db.query_with_params(&update_query, json!({
             "status": "draft"
         })).await?;
-        
-        let updated_articles: Vec<Article> = response.take(0)?;
+
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)?;
+        let list_json = normalize_surreal_json(raw_json);
+        let updated_articles: Vec<Article> = serde_json::from_value(list_json)?;
         let updated_article = updated_articles.into_iter().next()
             .ok_or_else(|| AppError::NotFound("Failed to unpublish article".to_string()))?;
         
@@ -912,14 +1162,9 @@ impl ArticleService {
         let today = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
         let tomorrow = today + chrono::Duration::days(1);
         
-        // 先获取统计数据
+        // 先获取统计数据（在应用层聚合，避免 Surreal 函数兼容性问题）
         let stats_query = r#"
-            SELECT 
-                count() as total_articles,
-                math::sum(view_count) as total_views,
-                math::sum(clap_count) as total_claps,
-                math::sum(comment_count) as total_comments,
-                math::mean(reading_time) as avg_reading_time
+            SELECT view_count, clap_count, comment_count, reading_time
             FROM article
             WHERE created_at >= $today 
             AND created_at < $tomorrow
@@ -929,10 +1174,31 @@ impl ArticleService {
             "today": today,
             "tomorrow": tomorrow
         })).await?;
-        
-        let stats: Vec<serde_json::Value> = response.take(0)?;
-        
-        if let Some(stat) = stats.first() {
+        let raw: SurrealValue = response.take(0)?;
+        let raw_json = serde_json::to_value(raw)?;
+        let list_json = normalize_surreal_json(raw_json);
+        let rows: Vec<JsonValue> = serde_json::from_value(list_json)?;
+
+        let total_articles = rows.len() as i64;
+        let mut total_views = 0i64;
+        let mut total_claps = 0i64;
+        let mut total_comments = 0i64;
+        let mut total_reading_time = 0f64;
+
+        for row in rows.iter() {
+            total_views += row.get("view_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            total_claps += row.get("clap_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            total_comments += row.get("comment_count").and_then(|v| v.as_i64()).unwrap_or(0);
+            total_reading_time += row.get("reading_time").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        }
+
+        let avg_reading_time = if total_articles > 0 {
+            total_reading_time / total_articles as f64
+        } else {
+            0.0
+        };
+
+        if total_articles >= 0 {
             // 创建或更新统计记录
             let upsert_query = r#"
                 UPDATE daily_article_stats:[$today] MERGE $stats
@@ -940,11 +1206,11 @@ impl ArticleService {
             
             let stats_data = json!({
                 "date": today,
-                "total_articles": stat.get("total_articles").and_then(|v| v.as_i64()).unwrap_or(0),
-                "total_views": stat.get("total_views").and_then(|v| v.as_i64()).unwrap_or(0),
-                "total_claps": stat.get("total_claps").and_then(|v| v.as_i64()).unwrap_or(0),
-                "total_comments": stat.get("total_comments").and_then(|v| v.as_i64()).unwrap_or(0),
-                "avg_reading_time": stat.get("avg_reading_time").and_then(|v| v.as_f64()).unwrap_or(0.0),
+                "total_articles": total_articles,
+                "total_views": total_views,
+                "total_claps": total_claps,
+                "total_comments": total_comments,
+                "avg_reading_time": avg_reading_time,
                 "updated_at": Utc::now()
             });
             
@@ -973,9 +1239,22 @@ impl ArticleService {
         })).await?;
 
         // 直接获取原始数据
-        let results: Vec<Value> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let results = surreal_to_json_list(raw);
         let author_data = results.into_iter().next()
             .ok_or_else(|| AppError::NotFound(format!("Author {} not found", author_id)))?;
+
+        let avatar_url = match author_data.get("avatar_url") {
+            Some(JsonValue::String(s)) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            }
+            _ => None,
+        };
 
         // 手动构造 AuthorInfo
         Ok(AuthorInfo {
@@ -991,9 +1270,7 @@ impl ArticleService {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_string(),
-            avatar_url: author_data.get("avatar_url")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string()),
+            avatar_url,
             is_verified: author_data.get("is_verified")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
@@ -1013,7 +1290,7 @@ impl ArticleService {
             "article_id": article_id
         })).await?;
 
-        let tag_relations: Vec<Value> = response.take(0).unwrap_or_default();
+        let tag_relations: Vec<JsonValue> = response.take(0).unwrap_or_default();
         
         if tag_relations.is_empty() {
             return Ok(Vec::new());
@@ -1036,7 +1313,7 @@ impl ArticleService {
             if let Ok(mut tag_response) = self.db.query_with_params(tag_query, json!({
                 "tag_id": tag_id
             })).await {
-                if let Ok(tag_values) = tag_response.take::<Vec<Value>>(0) {
+                if let Ok(tag_values) = tag_response.take::<Vec<JsonValue>>(0) {
                     for tag_value in tag_values {
                         if let Ok(tag_info) = serde_json::from_value::<TagInfo>(tag_value) {
                             tags.push(tag_info);
@@ -1081,7 +1358,7 @@ impl ArticleService {
             "series_id": series_id
         })).await?;
 
-        let series_data: Vec<Value> = response.take(0)?;
+        let series_data: Vec<JsonValue> = response.take(0)?;
         if let Some(series) = series_data.into_iter().next() {
             // Then get the order from series_article
             let order_query = r#"
@@ -1095,7 +1372,7 @@ impl ArticleService {
                 "article_id": article_id
             })).await?;
             
-            let order_data: Vec<Value> = order_response.take(0)?;
+            let order_data: Vec<JsonValue> = order_response.take(0)?;
             let order = order_data.into_iter().next()
                 .and_then(|v| v.get("order").and_then(|o| o.as_i64()))
                 .unwrap_or(0) as i32;
@@ -1224,7 +1501,7 @@ impl ArticleService {
                 error!("Failed to query existing claps: {:?}", e);
                 e
             })?;
-        let clap_data: Vec<Value> = response.take(0)?;
+        let clap_data: Vec<JsonValue> = response.take(0)?;
         let existing_clap = clap_data.into_iter().next();
 
         let user_clap_count = if let Some(clap_value) = existing_clap {
@@ -1262,7 +1539,7 @@ impl ArticleService {
                 "count": new_total
             })).await?;
             
-            let result: Vec<Value> = update_response.take(0)?;
+            let result: Vec<JsonValue> = update_response.take(0)?;
             result.into_iter().next()
                 .and_then(|v| v.get("count").and_then(|c| c.as_i64()))
                 .unwrap_or(new_total as i64) as i32
@@ -1290,7 +1567,7 @@ impl ArticleService {
             })).await?;
             
             // 检查创建是否成功
-            let created_results: Vec<Value> = create_response.take(0)?;
+            let created_results: Vec<JsonValue> = create_response.take(0)?;
             debug!("Created clap results: {:?}", created_results);
             
             count
@@ -1321,7 +1598,7 @@ impl ArticleService {
         debug!("Getting all clap counts for article: {}", article_id);
         
         let mut count_response = self.db.query(&count_query).await?;
-        let clap_records: Vec<Value> = count_response.take(0)?;
+        let clap_records: Vec<JsonValue> = count_response.take(0)?;
         
         // 在应用层计算总和
         let total_claps: i64 = clap_records.iter()
@@ -1420,7 +1697,9 @@ impl ArticleService {
         }
         
         let mut response = self.db.query_with_params(&query, params).await?;
-        let articles: Vec<ArticleListItem> = response.take(0)?;
+        let raw: SurrealValue = response.take(0)?;
+        let raw_list = surreal_to_json_list(raw);
+        let articles: Vec<ArticleListItem> = parse_from_json_list(raw_list);
         
         Ok(articles)
     }
@@ -1547,8 +1826,11 @@ impl ArticleService {
             "tag_ids": tag_ids,
             "limit": limit
         })).await?;
-        
-        Ok(response.take(0)?)
+
+        let raw: SurrealValue = response.take(0)?;
+        let raw_list = surreal_to_json_list(raw);
+        let articles: Vec<ArticleListItem> = parse_from_json_list(raw_list);
+        Ok(articles)
     }
     
     /// 获取出版物中特定用户的文章数量
@@ -1585,26 +1867,27 @@ impl ArticleService {
     /// 获取出版物的总浏览量
     pub async fn get_total_views_by_publication(&self, publication_id: &str) -> Result<usize> {
         debug!("Getting total views for publication {}", publication_id);
-        
         let query = r#"
-            SELECT math::sum(view_count) as total_views 
-            FROM article 
-            WHERE publication_id = $publication_id 
-                AND status = 'published' 
+            SELECT view_count
+            FROM article
+            WHERE publication_id = $publication_id
+                AND status = 'published'
                 AND is_deleted = false
         "#;
-        
+
         let mut response = self.db.query_with_params(query, json!({
             "publication_id": publication_id
         })).await?;
-        
-        let result: Vec<serde_json::Value> = response.take(0)?;
-        let count = result.first()
-            .and_then(|v| v.get("total_views"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0) as usize;
-        
-        Ok(count)
+
+        let raw: SurrealValue = response.take(0)?;
+        let values = surreal_to_json_list(raw);
+        let total_views: i64 = values
+            .iter()
+            .filter_map(|v| v.get("view_count"))
+            .filter_map(|v| v.as_i64())
+            .sum();
+
+        Ok(total_views.max(0) as usize)
     }
     
     /// Helper method to convert article data to ArticleListItem
@@ -1620,13 +1903,28 @@ impl ArticleService {
             "author_id": &article.author_id
         })).await?;
         
-        let author_data: Vec<Value> = author_response.take(0)?;
+        let author_raw: SurrealValue = author_response.take(0)?;
+        let author_data: Vec<JsonValue> = surreal_to_json_list(author_raw)
+            .into_iter()
+            .map(normalize_surreal_json)
+            .collect();
         let author_info = if let Some(author) = author_data.first() {
+            let avatar_url = match author.get("avatar_url") {
+                Some(JsonValue::String(s)) => {
+                    let trimmed = s.trim();
+                    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+                        None
+                    } else {
+                        Some(trimmed.to_string())
+                    }
+                }
+                _ => None,
+            };
             AuthorInfo {
                 id: author["id"].as_str().unwrap_or("").to_string(),
                 username: author["username"].as_str().unwrap_or("").to_string(),
                 display_name: author["display_name"].as_str().unwrap_or("").to_string(),
-                avatar_url: author["avatar_url"].as_str().map(String::from),
+                avatar_url,
                 is_verified: author["is_verified"].as_bool().unwrap_or(false),
             }
         } else {
@@ -1650,8 +1948,12 @@ impl ArticleService {
             let mut pub_response = self.db.query_with_params(pub_query, json!({
                 "publication_id": pub_id
             })).await?;
-            
-            let pub_data: Vec<Value> = pub_response.take(0)?;
+
+            let pub_raw: SurrealValue = pub_response.take(0)?;
+            let pub_data: Vec<JsonValue> = surreal_to_json_list(pub_raw)
+                .into_iter()
+                .map(normalize_surreal_json)
+                .collect();
             pub_data.first().map(|p| PublicationInfo {
                 id: p["id"].as_str().unwrap_or("").to_string(),
                 name: p["name"].as_str().unwrap_or("").to_string(),
@@ -1668,15 +1970,23 @@ impl ArticleService {
         let mut tag_rel_response = self.db.query_with_params(tag_relations_query, json!({
             "article_id": &article.id
         })).await?;
-        
-        let tag_relations: Vec<Value> = tag_rel_response.take(0)?;
+
+        let tag_rel_raw: Vec<SurrealValue> = tag_rel_response.take(0)?;
+        let tag_relations: Vec<JsonValue> = tag_rel_raw
+            .into_iter()
+            .filter_map(surreal_to_json)
+            .collect();
         let mut tags: Vec<TagInfo> = Vec::new();
         
         for rel in tag_relations {
             if let Some(tag_id) = rel.get("tag_id").and_then(|v| v.as_str()) {
                 // 获取tag详情
                 if let Ok(mut tag_response) = self.db.query(&format!("SELECT * FROM {}", tag_id)).await {
-                    if let Ok(tag_values) = tag_response.take::<Vec<Value>>(0) {
+                    if let Ok(tag_raw) = tag_response.take::<Vec<SurrealValue>>(0) {
+                        let tag_values: Vec<JsonValue> = tag_raw
+                            .into_iter()
+                            .filter_map(surreal_to_json)
+                            .collect();
                         if let Some(tag_value) = tag_values.first() {
                             tags.push(TagInfo {
                                 id: tag_value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),

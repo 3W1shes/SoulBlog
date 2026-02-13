@@ -23,7 +23,7 @@ pub struct UserInteraction {
     pub id: String,
     pub user_id: String,
     pub article_id: String,
-    pub interaction_type: InteractionType,
+    pub interaction_type: String,
     pub weight: f64,
     pub created_at: DateTime<Utc>,
 }
@@ -39,6 +39,17 @@ pub enum InteractionType {
 }
 
 impl InteractionType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            InteractionType::View => "View",
+            InteractionType::Clap => "Clap",
+            InteractionType::Comment => "Comment",
+            InteractionType::Bookmark => "Bookmark",
+            InteractionType::Share => "Share",
+            InteractionType::ReadComplete => "ReadComplete",
+        }
+    }
+
     pub fn default_weight(&self) -> f64 {
         match self {
             InteractionType::View => 1.0,
@@ -111,10 +122,15 @@ pub struct RecommendationRequest {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum RecommendationAlgorithm {
+    #[serde(rename = "content_based")]
     ContentBased,
+    #[serde(rename = "collaborative_filtering")]
     CollaborativeFiltering,
+    #[serde(rename = "hybrid")]
     Hybrid,
+    #[serde(rename = "trending")]
     Trending,
+    #[serde(rename = "following")]
     Following,
 }
 

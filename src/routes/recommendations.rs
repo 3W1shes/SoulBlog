@@ -21,6 +21,7 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/trending", get(get_trending))
         .route("/following", get(get_following_recommendations))
         .route("/related/:article_id", get(get_related_articles))
+        .route("/content-based/:article_id", get(get_content_based_articles))
         .route("/update", get(update_recommendations)) // 管理员手动触发更新
 }
 
@@ -110,6 +111,27 @@ async fn get_related_articles(
 
     let limit = params.limit.unwrap_or(5);
     
+    let related_articles = state
+        .recommendation_service
+        .get_related_articles(&article_id, limit)
+        .await?;
+
+    Ok(Json(json!({
+        "success": true,
+        "data": related_articles
+    })))
+}
+
+/// 获取内容相关推荐（兼容旧前端路由）
+/// GET /api/recommendations/content-based/:article_id
+async fn get_content_based_articles(
+    State(state): State<Arc<AppState>>,
+    Path(article_id): Path<String>,
+    Query(params): Query<RelatedArticlesQuery>,
+) -> Result<Json<Value>> {
+    debug!("Getting content-based recommendations for: {}", article_id);
+
+    let limit = params.limit.unwrap_or(5);
     let related_articles = state
         .recommendation_service
         .get_related_articles(&article_id, limit)
