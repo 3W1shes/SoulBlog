@@ -5,7 +5,9 @@ use crate::{
     models::media::MediaUploadResponse,
 };
 use axum::{
-    extract::{Path, Query, State, Multipart},
+    extract::{
+        multipart::MultipartRejection, DefaultBodyLimit, Multipart, Path, Query, State,
+    },
     response::{Json, Response},
     routing::{get, post, delete},
     Router,
@@ -24,6 +26,8 @@ pub fn router() -> Router<Arc<AppState>> {
         .route("/files/*path", get(serve_file))
         .route("/:file_id", delete(delete_file))
         .route("/", get(list_user_files))
+        // Let business-layer size checks (MAX_UPLOAD_SIZE) decide upload limits.
+        .layer(DefaultBodyLimit::disable())
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,9 +41,14 @@ pub struct MediaListQuery {
 pub async fn upload_image(
     State(app_state): State<Arc<AppState>>,
     Extension(user): Extension<User>,
-    mut multipart: Multipart,
+    multipart: std::result::Result<Multipart, MultipartRejection>,
 ) -> Result<Json<MediaUploadResponse>> {
     debug!("Processing image upload for user: {}", user.id);
+
+    let mut multipart = multipart.map_err(|e| {
+        error!("Multipart extraction failed: {}", e);
+        AppError::BadRequest(format!("上传请求格式错误: {}", e))
+    })?;
 
     let mut file_data: Option<Vec<u8>> = None;
     let mut filename: Option<String> = None;
@@ -78,7 +87,11 @@ pub async fn upload_image(
     // 调用媒体服务处理上传
     let upload_result = app_state.media_service
         .upload_image(&user.id, &filename, &content_type, file_data)
-        .await?;
+        .await
+        .map_err(|e| {
+            error!("Upload image failed for user {}: {}", user.id, e);
+            e
+        })?;
 
     info!("Successfully uploaded image for user: {}, filename: {}", user.id, filename);
 

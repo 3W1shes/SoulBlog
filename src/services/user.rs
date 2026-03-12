@@ -6,7 +6,8 @@ use crate::{
 use chrono::Utc;
 use serde_json::{json, Value};
 use std::sync::Arc;
-use surrealdb::sql::Thing;
+use soulcore::prelude::Thing;
+use surrealdb::types::ToSql;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 use validator::Validate;
@@ -18,6 +19,10 @@ pub struct UserService {
 }
 
 impl UserService {
+    fn first_profile_from_vec(rows: Vec<UserProfile>) -> Option<UserProfile> {
+        rows.into_iter().next()
+    }
+
     /// 创建新的用户服务实例
     pub async fn new(db: Arc<Database>) -> Result<Self> {
         Ok(Self { db })
@@ -54,8 +59,10 @@ impl UserService {
         };
 
         // 生成唯一用户名
+        let generated_profile_id = Uuid::new_v4().to_string();
+
         let mut profile = UserProfile {
-            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
+            id: Thing::new("user_profile", generated_profile_id.clone()),
             user_id: user_id.to_string(),
             username: original_username.clone(),
             display_name: original_username.clone(),
@@ -114,8 +121,8 @@ impl UserService {
                 github_username: {},
                 linkedin_url: {},
                 facebook_url: {},
-                stripe_customer_id: NULL,
-                stripe_account_id: NULL,
+                stripe_customer_id: NONE,
+                stripe_account_id: NONE,
                 follower_count: {},
                 following_count: {},
                 article_count: {},
@@ -125,8 +132,9 @@ impl UserService {
                 created_at: time::now(),
                 updated_at: time::now()
             }}
+            RETURN *, meta::id(id) AS id
             "#,
-            profile.id.id.to_string(),
+            generated_profile_id,
             profile.user_id,
             profile.username,
             profile.display_name,
@@ -134,53 +142,53 @@ impl UserService {
                 .email
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile.email_verified.unwrap_or(false),
             profile
                 .bio
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .avatar_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .cover_image_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .website
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .location
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .twitter_username
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .github_username
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .linkedin_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .facebook_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile.follower_count,
             profile.following_count,
             profile.article_count,
@@ -190,16 +198,14 @@ impl UserService {
         );
 
         let mut response = self.db.query(&create_query).await?;
-        let created: Vec<UserProfile> = response.take(0)?;
+        let created_profile = Self::first_profile_from_vec(response.take::<Vec<UserProfile>>(0)?);
 
-        if created.is_empty() {
+        let Some(created_profile) = created_profile else {
             error!("No user profile was created for user: {}", user_id);
             return Err(AppError::Internal(
                 "Failed to create user profile".to_string(),
             ));
-        }
-
-        let created_profile = created.into_iter().next().unwrap();
+        };
         info!(
             "Created new user profile for user: {} with username: {}",
             user_id, created_profile.username
@@ -212,13 +218,12 @@ impl UserService {
     pub async fn get_profile_by_user_id(&self, user_id: &str) -> Result<Option<UserProfile>> {
         debug!("Getting user profile by user_id: {}", user_id);
 
-        let query = "SELECT * FROM user_profile WHERE user_id = $user_id LIMIT 1";
+        let query = "SELECT *, meta::id(id) AS id FROM user_profile WHERE user_id = $user_id LIMIT 1";
         let mut response = self
             .db
             .query_with_params(query, json!({ "user_id": user_id }))
             .await?;
-        let profiles: Vec<UserProfile> = response.take(0)?;
-        Ok(profiles.into_iter().next())
+        Ok(Self::first_profile_from_vec(response.take::<Vec<UserProfile>>(0)?))
     }
 
     /// 统计用户已发布且未删除的文章数量
@@ -528,7 +533,7 @@ impl UserService {
 
         let (query, params) = if let Some(search_term) = search.clone() {
             let query_str = r#"
-                SELECT * FROM user_profile 
+                SELECT *, meta::id(id) AS id FROM user_profile 
                 WHERE username ~ $search OR display_name ~ $search OR email ~ $search
                 ORDER BY created_at DESC
                 LIMIT $limit START $offset
@@ -543,7 +548,7 @@ impl UserService {
             )
         } else {
             let query_str = r#"
-                SELECT * FROM user_profile 
+                SELECT *, meta::id(id) AS id FROM user_profile 
                 ORDER BY created_at DESC
                 LIMIT $limit START $offset
             "#;
@@ -593,7 +598,7 @@ impl UserService {
         debug!("Searching users with query: {}", query);
 
         let search_query = r#"
-            SELECT * FROM user_profile 
+            SELECT *, meta::id(id) AS id FROM user_profile 
             WHERE username ~ $query OR display_name ~ $query OR bio ~ $query
             ORDER BY follower_count DESC
             LIMIT $limit
@@ -717,7 +722,7 @@ impl UserService {
 
         // 生成唯一用户名
         let mut profile = UserProfile {
-            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
+            id: Thing::new("user_profile", Uuid::new_v4().to_string()),
             user_id: user_id.to_string(),
             username: original_username.clone(),
             display_name: display_name.unwrap_or_else(|| original_username.clone()),
@@ -764,8 +769,8 @@ impl UserService {
                 github_username: {},
                 linkedin_url: {},
                 facebook_url: {},
-                stripe_customer_id: NULL,
-                stripe_account_id: NULL,
+                stripe_customer_id: NONE,
+                stripe_account_id: NONE,
                 follower_count: {},
                 following_count: {},
                 article_count: {},
@@ -775,8 +780,9 @@ impl UserService {
                 created_at: time::now(),
                 updated_at: time::now()
             }}
+            RETURN *, meta::id(id) AS id
             "#,
-            profile.id.id.to_string(),
+            profile.id.key.to_sql(),
             profile.user_id,
             profile.username,
             profile.display_name,
@@ -784,47 +790,47 @@ impl UserService {
                 .bio
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .avatar_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .cover_image_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .website
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .location
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .twitter_username
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .github_username
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .linkedin_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile
                 .facebook_url
                 .as_ref()
                 .map(|s| format!("\"{}\"", s))
-                .unwrap_or("NULL".to_string()),
+                .unwrap_or("NONE".to_string()),
             profile.follower_count,
             profile.following_count,
             profile.article_count,
@@ -840,16 +846,16 @@ impl UserService {
             AppError::Internal(format!("Failed to create user profile: {}", e))
         })?;
 
-        let created: Vec<UserProfile> = response.take(0)?;
-        if created.is_empty() {
+        let created = Self::first_profile_from_vec(response.take::<Vec<UserProfile>>(0)?);
+        if created.is_none() {
             error!("No user profile was created for user: {}", user_id);
             return Err(AppError::Internal(
                 "Failed to create user profile".to_string(),
             ));
         }
 
-        let result = created.into_iter().next().unwrap();
-        debug!("Successfully created user profile with ID: {}", result.id);
+        let result = created.unwrap();
+        debug!("Successfully created user profile with ID: {}", result.id.to_sql());
         info!("Created user profile for user: {}", user_id);
 
         // 从数据库重新获取创建的记录，确保数据已经持久化
@@ -868,7 +874,7 @@ impl UserService {
         debug!("Getting popular users with limit: {}", limit);
 
         let query = r#"
-            SELECT * FROM user_profile 
+            SELECT *, meta::id(id) AS id FROM user_profile 
             WHERE is_suspended = false
             ORDER BY follower_count DESC, article_count DESC
             LIMIT $limit

@@ -39,55 +39,82 @@ pub async fn auth_middleware(
     request.extensions_mut().insert(app_state.auth_service.clone());
     request.extensions_mut().insert(app_state.user_service.clone());
     
-    // 检查是否有 Authorization 头
-    if let Some(auth_header) = headers.get("authorization") {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if auth_str.starts_with("Bearer ") {
-                let token = &auth_str[7..];
-                
-                // 验证 JWT
-                match app_state.auth_service.verify_jwt(token) {
-                    Ok(claims) => {
-                        // 尝试获取用户信息
-                        match app_state.auth_service.get_user_from_rainbow_auth(&claims.sub, token).await {
-                            Ok(user) => {
-                                debug!("Authenticated user: {} ({})", user.id, user.email);
-                                
-                                // 确保用户的 profile 存在
-                                let profile_result = app_state.user_service.get_or_create_profile(
-                                    &user.id,
-                                    &user.email,
-                                    user.is_verified,
-                                    user.username.clone(),
-                                    user.display_name.clone(),
-                                ).await;
-                                
-                                if let Err(e) = profile_result {
-                                    warn!("Failed to ensure user profile exists for user {}: {}", user.id, e);
-                                } else {
-                                    debug!("Successfully ensured user profile exists for user {}", user.id);
-                                }
-                                
-                                // 将用户信息添加到请求中
-                                info!("Inserting user into request extensions: {}", user.id);
-                                request.extensions_mut().insert(user);
-                            }
-                            Err(e) => {
-                                warn!("Failed to get user from Rainbow-Auth: {}", e);
-                                // 不返回错误，让请求继续处理（作为未认证请求）
-                            }
+    // 支持 Authorization 头和 SSO Cookie，两者任选其一
+    if let Some(token) = extract_bearer_token(&headers) {
+        // 验证 JWT
+        match app_state.auth_service.verify_jwt(&token) {
+            Ok(claims) => {
+                // 尝试获取用户信息
+                match app_state
+                    .auth_service
+                    .get_user_from_rainbow_auth(&claims.sub, &token)
+                    .await
+                {
+                    Ok(user) => {
+                        debug!("Authenticated user: {} ({})", user.id, user.email);
+
+                        // 确保用户的 profile 存在
+                        let profile_result = app_state
+                            .user_service
+                            .get_or_create_profile(
+                                &user.id,
+                                &user.email,
+                                user.is_verified,
+                                user.username.clone(),
+                                user.display_name.clone(),
+                            )
+                            .await;
+
+                        if let Err(e) = profile_result {
+                            warn!("Failed to ensure user profile exists for user {}: {}", user.id, e);
+                        } else {
+                            debug!("Successfully ensured user profile exists for user {}", user.id);
                         }
+
+                        // 将用户信息添加到请求中
+                        info!("Inserting user into request extensions: {}", user.id);
+                        request.extensions_mut().insert(user);
                     }
                     Err(e) => {
-                        debug!("JWT verification failed: {}", e);
+                        warn!("Failed to get user from Rainbow-Auth: {}", e);
                         // 不返回错误，让请求继续处理（作为未认证请求）
                     }
                 }
+            }
+            Err(e) => {
+                debug!("JWT verification failed: {}", e);
+                // 不返回错误，让请求继续处理（作为未认证请求）
             }
         }
     }
 
     Ok(next.run(request).await)
+}
+
+fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    if let Some(auth_header) = headers.get("authorization") {
+        if let Ok(auth_str) = auth_header.to_str() {
+            if let Some(token) = auth_str.strip_prefix("Bearer ") {
+                let token = token.trim();
+                if !token.is_empty() {
+                    return Some(token.to_string());
+                }
+            }
+        }
+    }
+
+    let cookie_header = headers.get("cookie")?.to_str().ok()?;
+    for part in cookie_header.split(';') {
+        let mut kv = part.trim().splitn(2, '=');
+        let key = kv.next()?.trim();
+        let value = kv.next().unwrap_or("").trim();
+        let is_token_key = matches!(key, "RB_BLOG_TOKEN" | "jwt_token" | "auth_token" | "token");
+        if is_token_key && !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+
+    None
 }
 
 /// 速率限制中间件

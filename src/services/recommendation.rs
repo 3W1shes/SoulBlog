@@ -20,7 +20,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{json, Value as JsonValue};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
-use surrealdb::Value as SurrealValue;
+use surrealdb::types::Value as SurrealValue;
 
 #[derive(Clone)]
 pub struct RecommendationService {
@@ -926,16 +926,24 @@ impl RecommendationService {
 
         // 基于标签找相关文章
         let query = r#"
-            SELECT DISTINCT a.*, COUNT(at1.tag_id) as common_tags
-            FROM article a
-            JOIN article_tag at1 ON a.id = at1.article_id
-            JOIN article_tag at2 ON at1.tag_id = at2.tag_id
-            WHERE at2.article_id = $article_id
-            AND a.id != $article_id
-            AND a.status = 'published'
-            AND a.is_deleted = false
-            GROUP BY a.id
-            ORDER BY common_tags DESC, a.clap_count DESC
+            LET $target_tags = (
+                SELECT VALUE tag_id FROM article_tag WHERE article_id = $article_id
+            );
+            SELECT *,
+                array::len((
+                    SELECT VALUE tag_id
+                    FROM article_tag
+                    WHERE article_id = id
+                    AND tag_id IN $target_tags
+                )) AS common_tags
+            FROM article
+            WHERE id != $article_id
+            AND status = 'published'
+            AND is_deleted = false
+            AND id IN (
+                SELECT VALUE article_id FROM article_tag WHERE tag_id IN $target_tags
+            )
+            ORDER BY common_tags DESC, clap_count DESC
             LIMIT $limit
         "#;
 
@@ -944,7 +952,8 @@ impl RecommendationService {
             "limit": limit
         })).await?;
 
-        let raw: SurrealValue = response.take(0)?;
+        // Statement 0 is LET, statement 1 is SELECT result.
+        let raw: SurrealValue = response.take(1)?;
         let articles: Vec<JsonValue> = surreal_value_to_json_list(raw)?;
         let mut recommendations = Vec::new();
 

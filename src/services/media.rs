@@ -2,7 +2,7 @@ use crate::{
     error::{Result, AppError},
     config::Config,
     models::media::{MediaFile, MediaUploadResponse},
-    utils::image::ImageProcessor,
+    utils::image::{ImageFormat, ImageProcessor},
     services::database::Database,
 };
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::sync::Arc;
 use chrono::{Utc, Datelike};
 use uuid::Uuid;
 use tokio::fs;
-use surrealdb::sql::Thing;
+use serde_json::json;
 
 #[derive(Clone)]
 pub struct MediaService {
@@ -27,9 +27,6 @@ impl MediaService {
     }
 
     pub async fn upload_image(&self, user_id: &str, filename: &str, content_type: &str, data: Vec<u8>) -> Result<MediaUploadResponse> {
-        // 验证文件类型
-        self.validate_image_type(content_type)?;
-        
         // 验证文件大小
         if data.len() as u64 > self.config.max_upload_size {
             return Err(AppError::BadRequest("文件大小超出限制".to_string()));
@@ -43,12 +40,17 @@ impl MediaService {
             return Err(AppError::BadRequest("无效的图片格式".to_string()));
         }
 
+        // 以文件内容检测的格式为准，避免浏览器上传时 content-type 不稳定导致误判
+        let detected_format = ImageProcessor::detect_format(&data)
+            .map_err(|e| AppError::BadRequest(format!("无法识别图片格式: {}", e)))?;
+        self.validate_image_type(content_type, &detected_format)?;
+
         // 获取图片尺寸
         let dimensions = image_processor.get_dimensions(&data).map_err(|e| AppError::BadRequest(e))?;
         let (width, height) = (dimensions.width, dimensions.height);
 
         // 生成文件名和存储路径
-        let file_extension = self.get_file_extension(content_type);
+        let file_extension = detected_format.to_extension();
         let file_id = Uuid::new_v4().to_string();
         let stored_filename = format!("{}.{}", file_id, file_extension);
         
@@ -73,29 +75,51 @@ impl MediaService {
         // 生成公开访问URL
         let public_url = format!("/api/blog/media/files/{}", storage_path.replace("uploads/", ""));
 
-        // 创建数据库记录
-        let media_file = MediaFile {
-            id: surrealdb::sql::Thing::from(("media_file".to_string(), file_id.clone())),
-            user_id: user_id.to_string(),
-            filename: stored_filename.clone(),
-            original_filename: filename.to_string(),
-            content_type: content_type.to_string(),
-            size: data.len() as i64,
-            width: Some(width),
-            height: Some(height),
-            storage_path: storage_path.clone(),
-            public_url: public_url.clone(),
-            created_at: now,
-        };
-
-        // 保存到数据库
-        let _: MediaFile = self.db
-            .create("media_file", media_file.clone())
+        // 使用纯 SQL + 基础类型参数写入，避免 RecordId/Datetime 序列化差异导致的 RPC 400
+        let create_query = r#"
+            CREATE media_file CONTENT {
+                user_id: $user_id,
+                filename: $filename,
+                original_filename: $original_filename,
+                content_type: $content_type,
+                size: $size,
+                width: $width,
+                height: $height,
+                storage_path: $storage_path,
+                public_url: $public_url,
+                created_at: time::now()
+            }
+            RETURN *, meta::id(id) AS id
+        "#;
+        let mut response = self.db
+            .query_with_params(
+                create_query,
+                json!({
+                    "user_id": user_id,
+                    "filename": stored_filename,
+                    "original_filename": filename,
+                    "content_type": detected_format.to_mime_type(),
+                    "size": data.len() as i64,
+                    "width": width,
+                    "height": height,
+                    "storage_path": storage_path,
+                    "public_url": public_url,
+                }),
+            )
             .await
             .map_err(|e| {
-                tracing::error!("Failed to save media file to database: {}", e);
+                tracing::error!("Failed to create media file record: {}", e);
                 AppError::Internal("保存文件信息到数据库失败".to_string())
             })?;
+
+        let media_files: Vec<MediaFile> = response.take(0).map_err(|e| {
+            tracing::error!("Failed to parse created media file: {}", e);
+            AppError::Internal("解析文件信息失败".to_string())
+        })?;
+        let media_file = media_files
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Internal("保存文件信息到数据库失败".to_string()))?;
 
         tracing::info!("Successfully uploaded image: {} for user: {}", stored_filename, user_id);
 
@@ -206,30 +230,68 @@ impl MediaService {
         Ok((files, total))
     }
 
-    fn validate_image_type(&self, content_type: &str) -> Result<()> {
-        let allowed_types: Vec<&str> = self.config.allowed_image_types
+    fn validate_image_type(&self, content_type: &str, detected_format: &ImageFormat) -> Result<()> {
+        let mut allowed_types: Vec<String> = self.config.allowed_image_types
             .split(',')
             .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        if allowed_types.is_empty() {
+            allowed_types = vec![
+                "image/jpeg".to_string(),
+                "image/png".to_string(),
+                "image/gif".to_string(),
+                "image/webp".to_string(),
+            ];
+        }
+
+        let normalized_content_type = content_type
+            .split(';')
+            .next()
+            .unwrap_or(content_type)
+            .trim()
+            .to_ascii_lowercase();
+        let detected_mime = detected_format.to_mime_type();
+        let detected_ext = detected_format.to_extension();
+
+        let normalize_allowed = |s: &str| -> String {
+            let lower = s.trim().to_ascii_lowercase();
+            if lower.starts_with("image/") {
+                return lower;
+            }
+            match lower.as_str() {
+                "jpg" | "jpeg" => "image/jpeg".to_string(),
+                "png" => "image/png".to_string(),
+                "gif" => "image/gif".to_string(),
+                "webp" => "image/webp".to_string(),
+                _ => lower,
+            }
+        };
+        let normalized_allowed: Vec<String> = allowed_types
+            .iter()
+            .map(|s| normalize_allowed(s))
             .collect();
 
-        if !allowed_types.contains(&content_type) {
+        // 允许以下两种情况：
+        // 1) 客户端 content-type 在白名单中
+        // 2) 客户端未准确上报时，按文件内容检测出的 MIME 在白名单中
+        let content_type_allowed = !normalized_content_type.is_empty()
+            && normalized_allowed.iter().any(|t| t == &normalized_content_type);
+        let detected_allowed = normalized_allowed.iter().any(|t| t == detected_mime);
+
+        if !(content_type_allowed || detected_allowed) {
             return Err(AppError::BadRequest(format!(
                 "不支持的图片格式: {}。支持的格式: {}",
-                content_type,
+                if normalized_content_type.is_empty() {
+                    detected_ext
+                } else {
+                    &normalized_content_type
+                },
                 self.config.allowed_image_types
             )));
         }
 
         Ok(())
-    }
-
-    fn get_file_extension(&self, content_type: &str) -> &str {
-        match content_type {
-            "image/jpeg" => "jpg",
-            "image/png" => "png",
-            "image/gif" => "gif",
-            "image/webp" => "webp",
-            _ => "bin",
-        }
     }
 }

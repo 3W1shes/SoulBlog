@@ -12,7 +12,7 @@ use axum::{
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -45,14 +45,48 @@ pub async fn get_current_user(
         user.is_verified, // Rainbow-Auth的邮箱验证状态
         user.username.clone(),
         user.display_name.clone(),
-    ).await?;
+    ).await;
 
     // 获取用户活动统计
-    let stats = app_state.user_service.get_user_stats(&user.id).await?;
+    let stats = app_state.user_service.get_user_stats(&user.id).await;
+
+    let profile_json = match profile {
+        Ok(p) => json!(p.to_response()),
+        Err(e) => {
+            warn!("get_or_create_profile failed in /auth/me for user {}: {}", user.id, e);
+            Value::Null
+        }
+    };
+    let stats_json = match stats {
+        Ok(s) => json!(s),
+        Err(e) => {
+            warn!("get_user_stats failed in /auth/me for user {}: {}", user.id, e);
+            json!({
+                "articles_written": 0,
+                "comments_made": 0,
+                "claps_given": 0,
+                "claps_received": 0,
+                "followers": 0,
+                "following": 0
+            })
+        }
+    };
 
     Ok(Json(json!({
         "success": true,
         "data": {
+            "authenticated": true,
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "username": user.username,
+                "display_name": user.display_name,
+                "avatar_url": user.avatar_url,
+                "is_verified": user.is_verified,
+                "created_at": user.created_at,
+                "roles": user.roles,
+                "permissions": user.permissions,
+            },
             "auth": {
                 "id": user.id,
                 "email": user.email,
@@ -64,8 +98,8 @@ pub async fn get_current_user(
                 "roles": user.roles,
                 "permissions": user.permissions,
             },
-            "profile": profile.to_response(),
-            "activity": stats
+            "profile": profile_json,
+            "activity": stats_json
         }
     })))
 }
@@ -132,10 +166,32 @@ pub async fn get_auth_info(
         user.is_verified,
         user.username.clone(),
         user.display_name.clone(),
-    ).await?;
+    ).await;
 
     // 获取用户活动统计
-    let stats = app_state.user_service.get_user_stats(&user.id).await?;
+    let stats = app_state.user_service.get_user_stats(&user.id).await;
+
+    let profile_json = match profile {
+        Ok(p) => json!(p.to_response()),
+        Err(e) => {
+            warn!("get_or_create_profile failed in /auth/refresh for user {}: {}", user.id, e);
+            Value::Null
+        }
+    };
+    let stats_json = match stats {
+        Ok(s) => json!(s),
+        Err(e) => {
+            warn!("get_user_stats failed in /auth/refresh for user {}: {}", user.id, e);
+            json!({
+                "articles_written": 0,
+                "comments_made": 0,
+                "claps_given": 0,
+                "claps_received": 0,
+                "followers": 0,
+                "following": 0
+            })
+        }
+    };
 
     // 获取系统配置（用户相关的）
     let user_config = json!({
@@ -156,6 +212,18 @@ pub async fn get_auth_info(
     Ok(Json(json!({
         "success": true,
         "data": {
+            "authenticated": true,
+            "user": {
+                "id": user.id,
+                "email": user.email,
+                "username": user.username,
+                "display_name": user.display_name,
+                "avatar_url": user.avatar_url,
+                "is_verified": user.is_verified,
+                "created_at": user.created_at,
+                "roles": user.roles,
+                "permissions": user.permissions,
+            },
             "auth": {
                 "id": user.id,
                 "email": user.email,
@@ -167,8 +235,8 @@ pub async fn get_auth_info(
                 "roles": user.roles,
                 "permissions": user.permissions,
             },
-            "profile": profile.to_response(),
-            "activity": stats,
+            "profile": profile_json,
+            "activity": stats_json,
             "config": user_config
         },
         "message": "Authentication info refreshed successfully"
@@ -196,7 +264,11 @@ pub async fn get_email_verification_status(
         user.is_verified,
         user.username.clone(),
         user.display_name.clone(),
-    ).await?;
+    ).await;
+
+    if let Err(e) = &profile {
+        warn!("get_or_create_profile failed in /auth/email-status for user {}: {}", user.id, e);
+    }
 
     Ok(Json(json!({
         "success": true,

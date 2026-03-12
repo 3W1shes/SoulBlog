@@ -9,8 +9,8 @@ use chrono::Utc;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::collections::HashMap;
-use surrealdb::sql::Thing;
-use surrealdb::Value as SurrealValue;
+use soulcore::prelude::Thing;
+use surrealdb::types::Value as SurrealValue;
 use tracing::{debug, error, info};
 use validator::Validate;
 use uuid::Uuid;
@@ -122,6 +122,11 @@ impl CommentService {
             .into_iter()
             .next()
             .ok_or_else(|| AppError::Internal("Failed to create comment - no results returned".to_string()))?;
+
+        // Some records may omit optional fields entirely; normalize them before deserialization.
+        if created_value.get("parent_id").is_none() {
+            created_value["parent_id"] = Value::Null;
+        }
             
         // 处理 SurrealDB 的 Thing 格式的 ID
         if let Some(id_obj) = created_value.get("id").and_then(|v| v.as_object()) {
@@ -216,6 +221,10 @@ impl CommentService {
         // Process each comment to fix the ID format
         let mut processed_comments = Vec::new();
         for mut comment_value in raw_comments {
+            if comment_value.get("parent_id").is_none() {
+                comment_value["parent_id"] = Value::Null;
+            }
+
             // Process the main comment ID
             if let Some(id_value) = comment_value.get("id") {
                 if let Some(id_str) = id_value.as_str() {

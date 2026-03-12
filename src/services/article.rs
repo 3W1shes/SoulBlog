@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use serde::de::DeserializeOwned;
 use soulcore::prelude::Thing;
-use surrealdb::Value as SurrealValue;
+use surrealdb::types::Value as SurrealValue;
 use uuid::Uuid;
 
 #[derive(Clone)]
@@ -409,11 +409,10 @@ impl ArticleService {
             params_map.insert("seo_description".into(), json!(seo_description));
         }
         params_map.insert("seo_keywords".into(), json!(article.seo_keywords));
-        if article.status == ArticleStatus::Published {
-            params_map.insert("published_at".into(), json!(Utc::now()));
-        }
-        params_map.insert("created_at".into(), json!(Utc::now()));
-        params_map.insert("updated_at".into(), json!(Utc::now()));
+        // NOTE:
+        // `created_at/updated_at/published_at` are datetime fields in schema.
+        // Do not send chrono timestamps as JSON strings in CONTENT payload.
+        // Let DB defaults fill created/updated, and set published_at via DB time::now().
         params_map.insert("is_deleted".into(), json!(false));
         if let Some(obj) = article.metadata.as_object() {
             if !obj.is_empty() {
@@ -436,9 +435,33 @@ impl ArticleService {
         let raw_json = serde_json::to_value(raw)?;
         debug!("Create article raw response: {}", raw_json);
         let list_json = normalize_surreal_json(raw_json);
-        let created_articles: Vec<Article> = serde_json::from_value(list_json)?;
-        let created_article = created_articles.into_iter().next()
+        let list = match list_json {
+            JsonValue::Array(arr) => arr,
+            other => vec![other],
+        };
+        let created_articles = parse_articles_from_value_list(list)?;
+        let mut created_article = created_articles.into_iter().next()
             .ok_or_else(|| AppError::Internal("Failed to create article".to_string()))?;
+
+        // If the article is created as published, ensure published_at is set with DB datetime.
+        if created_article.status == ArticleStatus::Published && created_article.published_at.is_none() {
+            let publish_query = format!(
+                "UPDATE article:`{}` SET published_at = time::now(), updated_at = time::now() RETURN *",
+                created_article.id
+            );
+            let mut publish_response = self.db.query(&publish_query).await?;
+            let raw: SurrealValue = publish_response.take(0)?;
+            let raw_json = serde_json::to_value(raw)?;
+            let list_json = normalize_surreal_json(raw_json);
+            let list = match list_json {
+                JsonValue::Array(arr) => arr,
+                other => vec![other],
+            };
+            let updated_articles = parse_articles_from_value_list(list)?;
+            if let Some(updated) = updated_articles.into_iter().next() {
+                created_article = updated;
+            }
+        }
 
         // 处理标签（如果有）
         if let Some(tags) = &request.tags {
@@ -544,7 +567,7 @@ impl ArticleService {
         }
 
         // 更新文章
-        let thing = Thing::from(("article".to_string(), article_id.to_string()));
+        let thing = Thing::new("article", article_id.to_string());
         let updated_article = self.db.update(thing, article).await?
             .ok_or_else(|| AppError::NotFound("Failed to update article".to_string()))?;
 
@@ -570,10 +593,9 @@ impl ArticleService {
         }
 
         // 软删除
-        let query = "UPDATE article SET is_deleted = true, updated_at = $now WHERE id = $id";
+        let query = "UPDATE article SET is_deleted = true, updated_at = time::now() WHERE id = $id";
         self.db.query_with_params(query, json!({
-            "id": article_id,
-            "now": Utc::now()
+            "id": article_id
         })).await?;
 
         info!("Deleted article: {}", article_id);
@@ -847,10 +869,9 @@ impl ArticleService {
     pub async fn increment_view_count(&self, article_id: &str) -> Result<()> {
         debug!("Incrementing view count for article: {}", article_id);
 
-        let query = "UPDATE article SET view_count += 1, updated_at = $now WHERE id = $id";
+        let query = "UPDATE article SET view_count += 1, updated_at = time::now() WHERE id = $id";
         self.db.query_with_params(query, json!({
-            "id": article_id,
-            "now": Utc::now()
+            "id": article_id
         })).await?;
 
         Ok(())
@@ -860,11 +881,10 @@ impl ArticleService {
     pub async fn increment_clap_count(&self, article_id: &str, count: u32) -> Result<()> {
         debug!("Incrementing clap count for article: {} by {}", article_id, count);
 
-        let query = "UPDATE article SET clap_count += $count, updated_at = $now WHERE id = $id";
+        let query = "UPDATE article SET clap_count += $count, updated_at = time::now() WHERE id = $id";
         self.db.query_with_params(query, json!({
             "id": article_id,
-            "count": count,
-            "now": Utc::now()
+            "count": count
         })).await?;
 
         Ok(())
@@ -876,12 +896,11 @@ impl ArticleService {
 
         let query = r#"
             LET $count = count((SELECT * FROM comment WHERE article_id = $id AND is_deleted = false));
-            UPDATE article SET comment_count = $count, updated_at = $now WHERE id = $id;
+            UPDATE article SET comment_count = $count, updated_at = time::now() WHERE id = $id;
         "#;
         
         self.db.query_with_params(query, json!({
-            "id": article_id,
-            "now": Utc::now()
+            "id": article_id
         })).await?;
 
         Ok(())
@@ -921,7 +940,7 @@ impl ArticleService {
         // 清理现有标签（规范为 record 类型进行匹配）
         let clear_query = r#"
             DELETE article_tag 
-            WHERE article_id = type::thing('article', $aid)
+            WHERE article_id = type::record("article", $aid)
         "#;
         self.db
             .query_with_params(clear_query, json!({ "aid": normalized_article_id }))
@@ -936,8 +955,8 @@ impl ArticleService {
             // 创建关联（确保以 record 类型写入）
             let create_query = r#"
                 CREATE article_tag SET 
-                    article_id = type::thing('article', $aid),
-                    tag_id = type::thing('tag', $tid)
+                    article_id = type::record("article", $aid),
+                    tag_id = type::record("tag", $tid)
             "#;
             self.db
                 .query_with_params(create_query, json!({
@@ -949,7 +968,7 @@ impl ArticleService {
             // 更新该标签的文章计数
             let count_query = r#"
                 SELECT VALUE count() FROM article_tag 
-                WHERE string::split(string::replace(string::replace(type::string(tag_id), '⟨', ''), '⟩', ''), ':')[1] = $tid
+                WHERE tag_id = type::record("tag", $tid)
             "#;
             let mut resp = self
                 .db
@@ -959,7 +978,7 @@ impl ArticleService {
             let count = counts.into_iter().next().unwrap_or(0);
 
             let update_count = r#"
-                UPDATE type::thing('tag', $tid) SET article_count = $count
+                UPDATE type::record("tag", $tid) SET article_count = $count
             "#;
             self.db
                 .query_with_params(update_count, json!({
@@ -1161,6 +1180,9 @@ impl ArticleService {
         // 使用更简单的方法来避免复杂的字段名
         let today = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
         let tomorrow = today + chrono::Duration::days(1);
+        let today_rfc3339 = chrono::DateTime::<Utc>::from_naive_utc_and_offset(today, Utc).to_rfc3339();
+        let tomorrow_rfc3339 =
+            chrono::DateTime::<Utc>::from_naive_utc_and_offset(tomorrow, Utc).to_rfc3339();
         
         // 先获取统计数据（在应用层聚合，避免 Surreal 函数兼容性问题）
         let stats_query = r#"
@@ -1171,11 +1193,10 @@ impl ArticleService {
         "#;
         
         let mut response = self.db.query_with_params(stats_query, json!({
-            "today": today,
-            "tomorrow": tomorrow
+            "today": today_rfc3339,
+            "tomorrow": tomorrow_rfc3339
         })).await?;
-        let raw: SurrealValue = response.take(0)?;
-        let raw_json = serde_json::to_value(raw)?;
+        let raw_json: JsonValue = response.take(0)?;
         let list_json = normalize_surreal_json(raw_json);
         let rows: Vec<JsonValue> = serde_json::from_value(list_json)?;
 
@@ -1199,23 +1220,25 @@ impl ArticleService {
         };
 
         if total_articles >= 0 {
-            // 创建或更新统计记录
+            // 创建或更新统计记录（SurrealDB 3: 使用 type::thing 避免 record-id 参数被解析为序列）
             let upsert_query = r#"
-                UPDATE daily_article_stats:[$today] MERGE $stats
+                UPDATE type::record($record_id) MERGE $stats
             "#;
-            
+            let today_id = today.date().to_string();
+            let record_id = format!("daily_article_stats:{}", today_id);
+
             let stats_data = json!({
-                "date": today,
+                "date": today_id,
                 "total_articles": total_articles,
                 "total_views": total_views,
                 "total_claps": total_claps,
                 "total_comments": total_comments,
                 "avg_reading_time": avg_reading_time,
-                "updated_at": Utc::now()
+                "updated_at": Utc::now().to_rfc3339()
             });
             
             self.db.query_with_params(upsert_query, json!({
-                "today": today.to_string(),
+                "record_id": record_id,
                 "stats": stats_data
             })).await?;
         }
@@ -1979,7 +2002,14 @@ impl ArticleService {
         let mut tags: Vec<TagInfo> = Vec::new();
         
         for rel in tag_relations {
-            if let Some(tag_id) = rel.get("tag_id").and_then(|v| v.as_str()) {
+            let tag_id_opt: Option<String> = match &rel {
+                JsonValue::Object(map) => map
+                    .get("tag_id")
+                    .and_then(JsonValue::as_str)
+                    .map(ToString::to_string),
+                _ => None,
+            };
+            if let Some(tag_id) = tag_id_opt {
                 // 获取tag详情
                 if let Ok(mut tag_response) = self.db.query(&format!("SELECT * FROM {}", tag_id)).await {
                     if let Ok(tag_raw) = tag_response.take::<Vec<SurrealValue>>(0) {
@@ -1988,10 +2018,18 @@ impl ArticleService {
                             .filter_map(surreal_to_json)
                             .collect();
                         if let Some(tag_value) = tag_values.first() {
+                            let (id, name, slug) = match tag_value {
+                                JsonValue::Object(map) => (
+                                    map.get("id").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                                    map.get("name").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                                    map.get("slug").and_then(JsonValue::as_str).unwrap_or("").to_string(),
+                                ),
+                                _ => ("".to_string(), "".to_string(), "".to_string()),
+                            };
                             tags.push(TagInfo {
-                                id: tag_value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                name: tag_value.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                                slug: tag_value.get("slug").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                                id,
+                                name,
+                                slug,
                             });
                         }
                     }

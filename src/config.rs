@@ -62,6 +62,7 @@ pub struct Config {
     pub enable_subscriptions: bool,
     pub enable_publications: bool,
     pub enable_email_notifications: bool,
+    pub enable_recommendation_tasks: bool,
 
     // Rate limiting
     pub rate_limit_requests: u32,
@@ -205,6 +206,9 @@ impl Config {
                 .parse()?,
             enable_email_notifications: env::var("ENABLE_EMAIL_NOTIFICATIONS")
                 .unwrap_or_else(|_| "true".to_string())
+                .parse()?,
+            enable_recommendation_tasks: env::var("ENABLE_RECOMMENDATION_TASKS")
+                .unwrap_or_else(|_| "false".to_string())
                 .parse()?,
 
             rate_limit_requests: env::var("RATE_LIMIT_REQUESTS")

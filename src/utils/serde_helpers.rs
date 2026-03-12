@@ -1,11 +1,71 @@
 /// 用于处理 SurrealDB Thing ID 的序列化/反序列化辅助模块
 
 use serde::{Deserialize, Deserializer, Serializer};
+use serde::de::IntoDeserializer;
 use chrono::{DateTime, Utc};
 
 /// 处理 SurrealDB 的 Thing ID 格式 (例如: "tag:xxxxx")
 pub mod thing_id {
     use super::*;
+    
+    fn extract_key(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(s) => Some(s.clone()),
+            serde_json::Value::Number(n) => Some(n.to_string()),
+            serde_json::Value::Bool(b) => Some(b.to_string()),
+            serde_json::Value::Object(map) => {
+                if let Some(table) = map.get("table").and_then(|v| v.as_str()) {
+                    if let Some(key_val) = map.get("key").or_else(|| map.get("id")) {
+                        if let Some(key) = extract_key(key_val) {
+                            return Some(format!("{}:{}", table, key));
+                        }
+                    }
+                }
+                if let Some(tb) = map.get("tb").and_then(|v| v.as_str()) {
+                    if let Some(id_val) = map.get("id").or_else(|| map.get("key")) {
+                        if let Some(key) = extract_key(id_val) {
+                            return Some(format!("{}:{}", tb, key));
+                        }
+                    }
+                }
+                if let Some(thing_val) = map.get("Thing") {
+                    return extract_key(thing_val);
+                }
+                if let Some(record_val) = map.get("RecordId") {
+                    return extract_key(record_val);
+                }
+                if let Some(v) = map.get("String") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("Strand") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("value") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("id") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("key") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("Int") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("Float") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("Number") {
+                    return extract_key(v);
+                }
+                if let Some(v) = map.get("Uuid") {
+                    return extract_key(v);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
     
     pub fn serialize<S>(id: &str, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -18,49 +78,104 @@ pub mod thing_id {
     where
         D: Deserializer<'de>,
     {
-        #[derive(Deserialize)]
-        #[serde(untagged)]
-        enum IdValue {
-            String(String),
-            Thing { 
-                tb: String, 
-                id: serde_json::Value 
-            },
-        }
-        
-        match IdValue::deserialize(deserializer)? {
-            IdValue::String(s) => Ok(s),
-            IdValue::Thing { tb, id } => {
-                match id {
-                    serde_json::Value::String(s) => Ok(format!("{}:{}", tb, s)),
-                    serde_json::Value::Number(n) => Ok(format!("{}:{}", tb, n)),
-                    serde_json::Value::Object(map) => {
-                        if let Some(value) = map.get("String").and_then(|v| v.as_str()) {
-                            return Ok(format!("{}:{}", tb, value));
-                        }
-                        if let Some(value) = map.get("id") {
-                            match value {
-                                serde_json::Value::String(s) => {
-                                    return Ok(format!("{}:{}", tb, s));
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        match value {
+            serde_json::Value::String(s) => Ok(s),
+            serde_json::Value::Object(mut map) => {
+                // Wrapped shape: {"Thing": {"tb":"article","id": ...}}
+                if let Some(thing) = map.remove("Thing") {
+                    if let serde_json::Value::Object(mut thing_map) = thing {
+                        let tb = thing_map
+                            .remove("tb")
+                            .and_then(|v| v.as_str().map(|s| s.to_string()))
+                            .unwrap_or_default();
+                        if !tb.is_empty() {
+                            if let Some(id_val) = thing_map.remove("id").or_else(|| thing_map.remove("key")) {
+                                if let Some(key) = extract_key(&id_val) {
+                                    return Ok(format!("{}:{}", tb, key));
                                 }
-                                serde_json::Value::Object(inner) => {
-                                    if let Some(s) = inner.get("String").and_then(|v| v.as_str()) {
-                                        return Ok(format!("{}:{}", tb, s));
-                                    }
-                                }
-                                _ => {}
                             }
                         }
-                        if let Some((_, value)) = map.iter().find(|(k, _)| k.eq_ignore_ascii_case("string")) {
-                            if let Some(s) = value.as_str() {
-                                return Ok(format!("{}:{}", tb, s));
-                            }
-                        }
-                        let fallback = serde_json::to_string(&map).unwrap_or_default();
-                        Ok(format!("{}:{}", tb, fallback))
                     }
-                    other => Ok(format!("{}:{}", tb, other)),
                 }
+
+                // Direct shape: {"tb":"article","id": ...}
+                if let Some(tb) = map.get("tb").and_then(|v| v.as_str()) {
+                    if let Some(id_val) = map.get("id").or_else(|| map.get("key")) {
+                        if let Some(key) = extract_key(id_val) {
+                            if key.contains(':') {
+                                return Ok(key);
+                            }
+                            return Ok(format!("{}:{}", tb, key));
+                        }
+                    }
+                }
+
+                // RecordId-ish shape: {"table":"article","key": ...}
+                if let Some(table) = map.get("table").and_then(|v| v.as_str()) {
+                    if let Some(key_val) = map.get("key").or_else(|| map.get("id")) {
+                        if let Some(key) = extract_key(key_val) {
+                            if key.contains(':') {
+                                return Ok(key);
+                            }
+                            return Ok(format!("{}:{}", table, key));
+                        }
+                    }
+                }
+
+                // Alternate wrapper shape: {"RecordId": {...}}
+                if let Some(record_val) = map.get("RecordId") {
+                    if let Some(key) = extract_key(record_val) {
+                        return Ok(key);
+                    }
+                }
+
+                // Pass-through scalar wrappers when no table context.
+                if let Some(key) = map
+                    .get("String")
+                    .or_else(|| map.get("Strand"))
+                    .or_else(|| map.get("value"))
+                    .and_then(extract_key)
+                {
+                    Ok(key)
+                } else {
+                    // Last-resort fallback to keep deserialization resilient across
+                    // Surreal/soulcore response shape variants.
+                    Ok(serde_json::Value::Object(map).to_string())
+                }
+            }
+            _ => Err(serde::de::Error::custom("invalid record id type")),
+        }
+    }
+}
+
+/// 处理可选的 SurrealDB Thing ID
+pub mod thing_id_option {
+    use super::*;
+
+    pub fn serialize<S>(id: &Option<String>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match id {
+            Some(v) => thing_id::serialize(v, serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::Object(ref map) if map.contains_key("None") => Ok(None),
+            other => {
+                let parsed = thing_id::deserialize(other.into_deserializer())
+                    .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                Ok(Some(parsed))
             }
         }
     }

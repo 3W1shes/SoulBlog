@@ -72,7 +72,7 @@ impl TagService {
         let limit = query.limit.unwrap_or(20).min(100);
         let offset = (page - 1) * limit;
         let mut sql = String::from(
-            "SELECT id, name, slug, description, follower_count, article_count, is_featured, created_at, updated_at FROM tag"
+            "SELECT meta::id(id) AS id, name, slug, description, follower_count, article_count, is_featured, created_at, updated_at FROM tag"
         );
         let mut conditions: Vec<String> = Vec::new();
         let mut params = serde_json::Map::new();
@@ -126,7 +126,7 @@ impl TagService {
 
     pub async fn get_tag_by_slug(&self, slug: &str) -> Result<Option<Tag>> {
         let sql = r#"
-            SELECT id, name, slug, description, follower_count, article_count, is_featured, created_at, updated_at
+            SELECT meta::id(id) AS id, name, slug, description, follower_count, article_count, is_featured, created_at, updated_at
             FROM tag WHERE slug = $slug LIMIT 1
         "#;
         let mut response = self.db.query_with_params(sql, json!({"slug": slug})).await?;

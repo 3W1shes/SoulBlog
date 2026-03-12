@@ -56,54 +56,77 @@ impl PublicationService {
         let theme_color = request
             .theme_color
             .unwrap_or_else(|| "#1a1a1a".to_string());
+        let sql_str = |s: &str| -> String { format!("'{}'", s.replace('\'', "''")) };
+        let sql_opt_str = |v: &Option<String>| -> String {
+            match v {
+                Some(s) => sql_str(s),
+                None => "NONE".to_string(),
+            }
+        };
 
-        let sql = r#"
-            CREATE publication SET
-                id = type::thing('publication', $id),
+        let create_sql = format!(
+            r#"
+            CREATE publication:`{}` SET
                 name = $name,
                 slug = $slug,
-                description = $description,
-                tagline = $tagline,
-                logo_url = $logo_url,
-                cover_image_url = $cover_image_url,
+                description = {},
+                tagline = {},
+                logo_url = {},
+                cover_image_url = {},
                 owner_id = $owner_id,
                 homepage_layout = $homepage_layout,
                 theme_color = $theme_color,
-                custom_domain = $custom_domain,
+                custom_domain = {},
                 member_count = 1,
                 article_count = 0,
                 follower_count = 0,
                 is_verified = false,
                 is_suspended = false,
                 created_at = time::now(),
-                updated_at = time::now();
-
-            SELECT type::string(id) AS id,
+                updated_at = time::now()
+            RETURN type::string(id) AS id,
                    name, slug, description, tagline, logo_url, cover_image_url,
                    owner_id, homepage_layout, theme_color, custom_domain,
                    member_count, article_count, follower_count, is_verified, is_suspended,
                    created_at, updated_at
-            FROM publication
-            WHERE id = type::thing('publication', $id);
-        "#;
+            "#,
+            id,
+            sql_opt_str(&request.description),
+            sql_opt_str(&request.tagline),
+            sql_opt_str(&request.logo_url),
+            sql_opt_str(&request.cover_image_url),
+            sql_opt_str(&request.custom_domain),
+        );
 
         let params = json!({
             "id": id,
             "name": request.name,
             "slug": slug,
-            "description": request.description,
-            "tagline": request.tagline,
-            "logo_url": request.logo_url,
-            "cover_image_url": request.cover_image_url,
             "owner_id": owner_id,
             "homepage_layout": homepage_layout,
             "theme_color": theme_color,
-            "custom_domain": request.custom_domain,
         });
 
-        let mut resp = self.db.query_with_params(sql, params).await?;
-        // 结果集 0 是 CREATE，结果集 1 是 SELECT 的结构化返回
-        let mut created_vec: Vec<Publication> = resp.take(1)?;
+        let mut resp = self.db.query_with_params(&create_sql, params).await?;
+        let mut created_vec: Vec<Publication> = resp.take(0)?;
+        if created_vec.is_empty() {
+            // Fallback: query by id if CREATE response is unexpectedly empty.
+            let fallback_sql = format!(
+                r#"
+                SELECT type::string(id) AS id,
+                       name, slug, description, tagline, logo_url, cover_image_url,
+                       owner_id, homepage_layout, theme_color, custom_domain,
+                       member_count, article_count, follower_count, is_verified, is_suspended,
+                       created_at, updated_at
+                FROM publication
+                WHERE id = type::record("publication", "{}")
+                LIMIT 1
+                "#,
+                id
+            );
+            let mut fallback_resp = self.db.query(&fallback_sql).await?;
+            created_vec = fallback_resp.take(0)?;
+        }
         let created_publication = created_vec
             .pop()
             .ok_or_else(|| AppError::internal("Failed to create publication"))?;
@@ -643,8 +666,8 @@ impl PublicationService {
 
         let sql = r#"
             CREATE publication_member CONTENT {
-                id: type::thing('publication_member', $id),
-                publication_id: type::thing('publication', string::split($publication_id, ':')[1] ?: $publication_id),
+                id: type::record("publication_member", $id),
+                publication_id: type::record("publication", string::split($publication_id, ':')[1] ?: $publication_id),
                 user_id: $user_id,
                 role: $role,
                 permissions: $permissions,

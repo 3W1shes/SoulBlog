@@ -152,6 +152,7 @@ impl IntoResponse for AppError {
                 (StatusCode::UNAUTHORIZED, "Invalid token".to_string(), "JWT_ERROR")
             }
             AppError::ValidatorError(e) => {
+                tracing::warn!("Validation failed: {:?}", e);
                 let validation_errors = e
                     .field_errors()
                     .iter()
@@ -230,6 +231,6 @@ impl From<anyhow::Error> for AppError {
 
 impl From<SoulCoreError> for AppError {
     fn from(err: SoulCoreError) -> Self {
-        AppError::Database(surrealdb::Error::Api(surrealdb::error::Api::Query(err.to_string())))
+        AppError::Database(surrealdb::Error::thrown(err.to_string()))
     }
 }

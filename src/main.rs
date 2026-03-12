@@ -1,10 +1,10 @@
 use std::sync::Arc;
 use axum::{
     extract::{Query, State},
-    response::Html,
+    response::{Html, IntoResponse},
     routing::{Router, get, post},
     Extension,
-    http::{Method, HeaderValue},
+    http::{Method, HeaderValue, header::SET_COOKIE},
     middleware,
 };
 use serde::Deserialize;
@@ -303,10 +303,10 @@ struct SsoParams {
 async fn sso_bridge(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SsoParams>,
-) -> Html<String> {
+) -> impl IntoResponse {
     let token = params.token.unwrap_or_default();
     if token.trim().is_empty() {
-        return Html("missing token".to_string());
+        return Html("missing token".to_string()).into_response();
     }
     let next = params
         .next
@@ -337,7 +337,15 @@ async fn sso_bridge(
   </body>
 </html>"#
     );
-    Html(html)
+    let cookie = format!(
+        "RB_BLOG_TOKEN={}; Path=/; Max-Age=2592000; HttpOnly; SameSite=Lax",
+        token
+    );
+    (
+        [(SET_COOKIE, HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static("RB_BLOG_TOKEN=; Path=/; Max-Age=0; SameSite=Lax")))],
+        Html(html),
+    )
+        .into_response()
 }
 
 async fn auto_start_database(config: &Config) -> anyhow::Result<()> {
@@ -370,20 +378,24 @@ async fn auto_start_database(config: &Config) -> anyhow::Result<()> {
 async fn start_background_tasks(app_state: Arc<AppState>) {
     info!("Starting background tasks...");
 
-    // 推荐系统更新任务
-    let recommendation_state = app_state.clone();
-    tokio::spawn(async move {
-        let mut interval = interval(Duration::from_secs(
-            recommendation_state.config.recommendation_update_interval
-        ));
-        
-        loop {
-            interval.tick().await;
-            if let Err(e) = recommendation_state.recommendation_service.update_recommendations().await {
-                error!("Failed to update recommendations: {}", e);
+    // 推荐系统更新任务（可通过 ENABLE_RECOMMENDATION_TASKS 开关关闭）
+    if app_state.config.enable_recommendation_tasks {
+        let recommendation_state = app_state.clone();
+        tokio::spawn(async move {
+            let mut interval = interval(Duration::from_secs(
+                recommendation_state.config.recommendation_update_interval
+            ));
+            
+            loop {
+                interval.tick().await;
+                if let Err(e) = recommendation_state.recommendation_service.update_recommendations().await {
+                    error!("Failed to update recommendations: {}", e);
+                }
             }
-        }
-    });
+        });
+    } else {
+        info!("Recommendation background task is disabled by ENABLE_RECOMMENDATION_TASKS=false");
+    }
 
     // 统计数据聚合任务
     let stats_state = app_state.clone();

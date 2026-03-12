@@ -1,11 +1,12 @@
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
-use surrealdb::sql::Thing;
+use serde::{de::Error as DeError, Deserialize, Deserializer, Serialize};
+use surrealdb::types::{RecordId as Thing, ToSql};
 use uuid::Uuid;
 use validator::Validate;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserProfile {
+    #[serde(deserialize_with = "deserialize_user_profile_id")]
     pub id: Thing,
     pub user_id: String, // Rainbow-Auth 用户ID
     pub username: String,
@@ -168,7 +169,7 @@ impl UserProfile {
     pub fn new(user_id: String, username: String, display_name: String) -> Self {
         let now = Utc::now();
         Self {
-            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
+            id: Thing::new("user_profile", Uuid::new_v4().to_string()),
             user_id,
             username,
             display_name,
@@ -198,7 +199,7 @@ impl UserProfile {
 
     pub fn to_response(&self) -> UserProfileResponse {
         UserProfileResponse {
-            id: self.id.id.to_string(),
+            id: self.id.key.to_sql().trim_matches('`').to_string(),
             user_id: self.user_id.clone(),
             username: self.username.clone(),
             display_name: self.display_name.clone(),
@@ -226,11 +227,121 @@ impl UserProfile {
     }
 }
 
+fn deserialize_user_profile_id<'de, D>(deserializer: D) -> Result<Thing, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+
+    if let Ok(id) = Thing::deserialize(value.clone()) {
+        return Ok(id);
+    }
+
+    match value {
+        serde_json::Value::String(s) => {
+            let raw = s.trim_matches('`').to_string();
+            if let Some((table, key)) = raw.split_once(':') {
+                Ok(Thing::new(table, key.trim_matches('`').to_string()))
+            } else {
+                Ok(Thing::new("user_profile", raw))
+            }
+        }
+        serde_json::Value::Object(map) => {
+            // Surreal v3 可能返回 {"RecordId":{"table":"...","key":...}}
+            if let Some(serde_json::Value::Object(record_id)) = map.get("RecordId") {
+                let table = record_id
+                    .get("table")
+                    .or_else(|| record_id.get("tb"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("user_profile")
+                    .to_string();
+                let key = record_id
+                    .get("key")
+                    .or_else(|| record_id.get("id"))
+                    .and_then(extract_record_key)
+                    .ok_or_else(|| D::Error::custom("invalid record id object"))?;
+                return Ok(Thing::new(table, key.trim_matches('`').to_string()));
+            }
+
+            let table = map
+                .get("table")
+                .or_else(|| map.get("tb"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("user_profile")
+                .to_string();
+            let key = map
+                .get("key")
+                .or_else(|| map.get("id"))
+                .and_then(extract_record_key)
+                .ok_or_else(|| D::Error::custom("invalid record id object"))?;
+            Ok(Thing::new(table, key.trim_matches('`').to_string()))
+        }
+        _ => Err(D::Error::custom("invalid record id type")),
+    }
+}
+
+fn extract_record_key(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        serde_json::Value::Object(map) => {
+            if let Some(table) = map.get("table").and_then(|x| x.as_str()) {
+                if let Some(key_val) = map.get("key").or_else(|| map.get("id")) {
+                    if let Some(key) = extract_record_key(key_val) {
+                        return Some(format!("{}:{}", table, key));
+                    }
+                }
+            }
+            if let Some(tb) = map.get("tb").and_then(|x| x.as_str()) {
+                if let Some(id_val) = map.get("id").or_else(|| map.get("key")) {
+                    if let Some(key) = extract_record_key(id_val) {
+                        return Some(format!("{}:{}", tb, key));
+                    }
+                }
+            }
+            if let Some(inner) = map.get("RecordId") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("Thing") {
+                return extract_record_key(inner);
+            }
+            // Surreal tagged scalar payloads, e.g. {"String":"..."} / {"Number":{"Int":1}}
+            if let Some(inner) = map.get("String") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("Strand") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("Uuid") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("Number") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("Int") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("Float") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("Bool") {
+                return extract_record_key(inner);
+            }
+            if let Some(inner) = map.get("value") {
+                return extract_record_key(inner);
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 impl From<CreateUserProfileRequest> for UserProfile {
     fn from(req: CreateUserProfileRequest) -> Self {
         let now = Utc::now();
         Self {
-            id: Thing::from(("user_profile".to_string(), Uuid::new_v4().to_string())),
+            id: Thing::new("user_profile", Uuid::new_v4().to_string()),
             user_id: String::new(), // 将在服务层设置
             username: req.username,
             display_name: req.display_name,

@@ -1,7 +1,7 @@
 use crate::{
     error::{AppError, Result},
     models::user::*,
-    services::auth::User,
+    services::auth::{OptionalUser, User},
     state::AppState,
     require_permission,
 };
@@ -17,6 +17,10 @@ use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, debug};
+
+fn require_authenticated_user(user: Option<User>) -> Result<User> {
+    user.ok_or_else(|| AppError::Authentication("Authentication required".to_string()))
+}
 
 pub fn router() -> Router<Arc<AppState>> {
     Router::new()
@@ -240,8 +244,9 @@ pub async fn get_user_activity_stats(
 /// GET /api/users/me
 pub async fn get_current_user_profile(
     State(app_state): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
+    OptionalUser(user): OptionalUser,
 ) -> Result<Json<Value>> {
+    let user = require_authenticated_user(user)?;
     debug!("Fetching current user profile for user: {}", user.id);
 
     let profile = app_state.user_service.get_or_create_profile(
@@ -275,13 +280,23 @@ pub async fn get_current_user_profile(
 /// PUT /api/users/me
 pub async fn update_current_user_profile(
     State(app_state): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
+    OptionalUser(user): OptionalUser,
     Json(request): Json<UpdateUserProfileRequest>,
 ) -> Result<Json<Value>> {
+    let user = require_authenticated_user(user)?;
     debug!("Updating current user profile for user: {}", user.id);
 
     // 检查权限
     require_permission!(app_state.auth_service, user, "user.update_profile");
+
+    // 确保资料存在，避免首次更新时返回 404
+    app_state.user_service.get_or_create_profile(
+        &user.id,
+        &user.email,
+        user.is_verified,
+        user.username.clone(),
+        user.display_name.clone(),
+    ).await?;
 
     // 更新用户资料
     let profile = app_state.user_service.update_profile(&user.id, request).await?;
@@ -299,9 +314,10 @@ pub async fn update_current_user_profile(
 /// GET /api/users/me/articles
 pub async fn get_current_user_articles(
     State(app_state): State<Arc<AppState>>,
-    Extension(user): Extension<User>,
+    OptionalUser(user): OptionalUser,
     Query(query): Query<UserArticlesQuery>,
 ) -> Result<Json<Value>> {
+    let user = require_authenticated_user(user)?;
     debug!("Fetching articles for current user: {}", user.id);
 
     let page = query.page.unwrap_or(1);

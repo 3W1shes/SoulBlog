@@ -1,10 +1,10 @@
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
-use surrealdb::sql::Thing;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaFile {
-    pub id: Thing,
+    #[serde(with = "crate::utils::serde_helpers::thing_id")]
+    pub id: String,
     pub user_id: String,
     pub filename: String,
     pub original_filename: String,
@@ -38,8 +38,14 @@ pub struct MediaStats {
 
 impl MediaFile {
     pub fn to_response(&self) -> MediaUploadResponse {
+        let id = self
+            .id
+            .split_once(':')
+            .map(|(_, key)| key.to_string())
+            .unwrap_or_else(|| self.id.clone());
+
         MediaUploadResponse {
-            id: self.id.id.to_string(),
+            id,
             url: self.public_url.clone(),
             filename: self.filename.clone(),
             size: self.size,
