@@ -1,0 +1,509 @@
+{
+  "schema_version": "1.0",
+  "service": "soulblog",
+  "description": "SoulBlog Agent API v1 - OpenClaw Tool Catalog",
+  "base_url": "{SOULBLOG_BASE_URL}/agent/v1",
+  "authentication": {
+    "type": "bearer",
+    "header": "Authorization",
+    "prefix": "Bearer",
+    "scopes": {
+      "read": [
+        "blog:system:health",
+        "blog:publication:read",
+        "blog:article:read",
+        "blog:comment:read",
+        "blog:search:read"
+      ],
+      "write": [
+        "blog:comment:write"
+      ]
+    }
+  },
+  "tools": [
+    {
+      "name": "soulblog_health",
+      "description": "Check SoulBlog service health and get available capabilities",
+      "method": "GET",
+      "endpoint": "/system/health",
+      "authentication": "none",
+      "parameters": {},
+      "response": {
+        "type": "object",
+        "fields": {
+          "status": "string",
+          "version": "string",
+          "capabilities": "string[]"
+        }
+      }
+    },
+    {
+      "name": "soulblog_list_publications",
+      "description": "List blog publications with optional filtering and pagination",
+      "method": "GET",
+      "endpoint": "/publications",
+      "authentication": "none",
+      "parameters": {
+        "query": {
+          "page": {
+            "type": "integer",
+            "description": "Page number",
+            "default": 1,
+            "required": false
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Items per page (max 100)",
+            "default": 20,
+            "required": false
+          },
+          "search": {
+            "type": "string",
+            "description": "Search keyword",
+            "required": false
+          },
+          "sort": {
+            "type": "string",
+            "description": "Sort order: newest, oldest, popular, alphabetical",
+            "default": "popular",
+            "required": false
+          },
+          "verified_only": {
+            "type": "boolean",
+            "description": "Only show verified publications",
+            "default": false,
+            "required": false
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "fields": {
+          "publications": "PublicationListItem[]",
+          "total": "integer",
+          "page": "integer",
+          "per_page": "integer"
+        }
+      }
+    },
+    {
+      "name": "soulblog_get_publication",
+      "description": "Get detailed information about a specific publication",
+      "method": "GET",
+      "endpoint": "/publications/{id}",
+      "authentication": "none",
+      "parameters": {
+        "path": {
+          "id": {
+            "type": "string",
+            "description": "Publication ID",
+            "required": true
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "fields": {
+          "id": "string",
+          "name": "string",
+          "slug": "string",
+          "description": "string",
+          "tagline": "string",
+          "logo_url": "string",
+          "cover_image_url": "string",
+          "member_count": "integer",
+          "article_count": "integer",
+          "follower_count": "integer",
+          "is_verified": "boolean",
+          "is_member": "boolean",
+          "member_role": "string",
+          "is_following": "boolean",
+          "recent_articles": "ArticleListItem[]"
+        }
+      }
+    },
+    {
+      "name": "soulblog_list_articles",
+      "description": "List articles with optional filtering and pagination",
+      "method": "GET",
+      "endpoint": "/articles",
+      "authentication": "none",
+      "parameters": {
+        "query": {
+          "page": {
+            "type": "integer",
+            "description": "Page number",
+            "default": 1,
+            "required": false
+          },
+          "limit": {
+            "type": "integer",
+            "description": "Items per page (max 100)",
+            "default": 20,
+            "required": false
+          },
+          "publication_id": {
+            "type": "string",
+            "description": "Filter by publication ID",
+            "required": false
+          },
+          "author": {
+            "type": "string",
+            "description": "Filter by author ID or username",
+            "required": false
+          },
+          "tag": {
+            "type": "string",
+            "description": "Filter by tag",
+            "required": false
+          },
+          "featured": {
+            "type": "boolean",
+            "description": "Only show featured articles",
+            "required": false
+          },
+          "search": {
+            "type": "string",
+            "description": "Search keyword",
+            "required": false
+          },
+          "sort": {
+            "type": "string",
+            "description": "Sort order: newest, oldest, popular, trending",
+            "default": "newest",
+            "required": false
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "fields": {
+          "articles": "ArticleListItem[]",
+          "total": "integer",
+          "page": "integer",
+          "per_page": "integer"
+        }
+      }
+    },
+    {
+      "name": "soulblog_get_article",
+      "description": "Get detailed information about a specific article including full content",
+      "method": "GET",
+      "endpoint": "/articles/{id}",
+      "authentication": "none",
+      "parameters": {
+        "path": {
+          "id": {
+            "type": "string",
+            "description": "Article ID",
+            "required": true
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "fields": {
+          "id": "string",
+          "title": "string",
+          "subtitle": "string",
+          "slug": "string",
+          "content": "string (markdown)",
+          "content_html": "string (html)",
+          "excerpt": "string",
+          "cover_image_url": "string",
+          "author": "AuthorInfo",
+          "publication": "PublicationInfo",
+          "series": "SeriesInfo",
+          "status": "string",
+          "is_paid_content": "boolean",
+          "is_featured": "boolean",
+          "reading_time": "integer",
+          "word_count": "integer",
+          "view_count": "integer",
+          "clap_count": "integer",
+          "comment_count": "integer",
+          "bookmark_count": "integer",
+          "tags": "TagInfo[]",
+          "seo_title": "string",
+          "seo_description": "string",
+          "seo_keywords": "string[]",
+          "created_at": "datetime",
+          "updated_at": "datetime",
+          "published_at": "datetime"
+        }
+      }
+    },
+    {
+      "name": "soulblog_search",
+      "description": "Search articles and publications by keyword",
+      "method": "GET",
+      "endpoint": "/search",
+      "authentication": "optional",
+      "parameters": {
+        "query": {
+          "q": {
+            "type": "string",
+            "description": "Search query (required)",
+            "required": true
+          },
+          "type": {
+            "type": "string",
+            "description": "Search type: article, publication, all",
+            "default": "all",
+            "required": false
+          },
+          "page": {
+            "type": "integer",
+            "description": "Page number",
+            "default": 1,
+            "required": false
+          },
+          "per_page": {
+            "type": "integer",
+            "description": "Items per page (max 100)",
+            "default": 20,
+            "required": false
+          },
+          "publication_id": {
+            "type": "string",
+            "description": "Filter by publication ID",
+            "required": false
+          },
+          "author_id": {
+            "type": "string",
+            "description": "Filter by author ID",
+            "required": false
+          },
+          "tag": {
+            "type": "string",
+            "description": "Filter by tag",
+            "required": false
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "fields": {
+          "results": "SearchResultItem[]",
+          "total": "integer",
+          "page": "integer",
+          "per_page": "integer",
+          "query": "string"
+        }
+      }
+    },
+    {
+      "name": "soulblog_list_comments",
+      "description": "List comments for a specific article",
+      "method": "GET",
+      "endpoint": "/comments",
+      "authentication": "none",
+      "parameters": {
+        "query": {
+          "article_id": {
+            "type": "string",
+            "description": "Article ID (required)",
+            "required": true
+          },
+          "page": {
+            "type": "integer",
+            "description": "Page number",
+            "default": 1,
+            "required": false
+          },
+          "per_page": {
+            "type": "integer",
+            "description": "Items per page (max 100)",
+            "default": 20,
+            "required": false
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "fields": {
+          "comments": "CommentListItem[]",
+          "total": "integer",
+          "page": "integer",
+          "per_page": "integer"
+        }
+      }
+    },
+    {
+      "name": "soulblog_create_comment",
+      "description": "Create a new comment on an article",
+      "method": "POST",
+      "endpoint": "/comments",
+      "authentication": "required",
+      "required_scopes": ["blog:comment:write"],
+      "parameters": {
+        "body": {
+          "article_id": {
+            "type": "string",
+            "description": "Article ID to comment on",
+            "required": true
+          },
+          "content": {
+            "type": "string",
+            "description": "Comment content",
+            "required": true
+          },
+          "parent_id": {
+            "type": "string",
+            "description": "Parent comment ID for replies",
+            "required": false
+          }
+        }
+      },
+      "response": {
+        "type": "object",
+        "fields": {
+          "id": "string",
+          "content": "string",
+          "author": "AuthorInfo",
+          "article_id": "string",
+          "parent_id": "string",
+          "reply_count": "integer",
+          "clap_count": "integer",
+          "created_at": "datetime"
+        }
+      }
+    }
+    }
+  ],
+  "types": {
+    "PublicationListItem": {
+      "id": "string",
+      "name": "string",
+      "slug": "string",
+      "description": "string",
+      "tagline": "string",
+      "logo_url": "string",
+      "cover_image_url": "string",
+      "member_count": "integer",
+      "article_count": "integer",
+      "follower_count": "integer",
+      "is_verified": "boolean",
+      "created_at": "datetime"
+    },
+    "ArticleListItem": {
+      "id": "string",
+      "title": "string",
+      "subtitle": "string",
+      "slug": "string",
+      "excerpt": "string",
+      "cover_image_url": "string",
+      "author": "AuthorInfo",
+      "publication": "PublicationInfo",
+      "status": "string",
+      "is_paid_content": "boolean",
+      "is_featured": "boolean",
+      "reading_time": "integer",
+      "view_count": "integer",
+      "clap_count": "integer",
+      "comment_count": "integer",
+      "tags": "TagInfo[]",
+      "created_at": "datetime",
+      "published_at": "datetime"
+    },
+    "AuthorInfo": {
+      "id": "string",
+      "username": "string",
+      "display_name": "string",
+      "avatar_url": "string",
+      "is_verified": "boolean"
+    },
+    "PublicationInfo": {
+      "id": "string",
+      "name": "string",
+      "slug": "string",
+      "logo_url": "string"
+    },
+    "SeriesInfo": {
+      "id": "string",
+      "title": "string",
+      "slug": "string",
+      "order": "integer"
+    },
+    "TagInfo": {
+      "id": "string",
+      "name": "string",
+      "slug": "string"
+    },
+    "CommentListItem": {
+      "id": "string",
+      "content": "string",
+      "author": "AuthorInfo",
+      "parent_id": "string",
+      "reply_count": "integer",
+      "clap_count": "integer",
+      "created_at": "datetime"
+    }
+    },
+    "SearchResultItem": {
+      "oneOf": ["ArticleListItem", "PublicationListItem"]
+    }
+  },
+  "examples": {
+    "health_check": {
+      "request": "GET /agent/v1/system/health",
+      "response": {
+        "ok": true,
+        "data": {
+          "status": "ok",
+          "version": "0.1.0",
+          "capabilities": [
+            "system.health",
+            "publication.list",
+            "publication.get",
+            "article.list",
+            "article.get",
+            "search",
+            "comment.list",
+            "comment.create"
+          ]
+        },
+        "request_id": "agv1-1742350000000-1a2b"
+      }
+    },
+    "list_articles": {
+      "request": "GET /agent/v1/articles?publication_id=pub:xxx&sort=popular&limit=10",
+      "response": {
+        "ok": true,
+        "data": {
+          "articles": [...],
+          "total": 100,
+          "page": 1,
+          "per_page": 10
+        },
+        "request_id": "agv1-1742350000000-2b3c"
+      }
+    },
+    "search": {
+      "request": "GET /agent/v1/search?q=rust&type=article&per_page=5",
+      "response": {
+        "ok": true,
+        "data": {
+          "results": [...],
+          "total": 50,
+          "page": 1,
+          "per_page": 5,
+          "query": "rust"
+        },
+        "request_id": "agv1-1742350000000-3c4d"
+      }
+    },
+    "create_comment": {
+      "request": "POST /agent/v1/comments\nAuthorization: Bearer <token>\n\n{\"article_id\": \"article:xxx\", \"content\": \"Great article!\"}",
+      "response": {
+        "ok": true,
+        "data": {
+          "id": "comment:uuid",
+          "content": "Great article!",
+          ...
+        },
+        "request_id": "agv1-1742350000000-4d5e"
+      }
+    }
+  }
+}
