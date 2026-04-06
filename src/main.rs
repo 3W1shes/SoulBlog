@@ -24,6 +24,7 @@ mod config;
 mod error;
 mod utils;
 mod state;
+mod agent;
 
 #[cfg(feature = "metrics")]
 mod metrics;
@@ -215,6 +216,9 @@ async fn main() -> anyhow::Result<()> {
         // Health check endpoints (no domain context needed)
         .route("/health", get(health_check))
         .route("/sso", get(sso_bridge))
+        
+        // Agent API v1 (for OpenClaw / Agent integration)
+        .nest("/agent/v1", agent::agent_router(app_state.clone()))
         
         // Domain-specific routes (work with custom domains and subdomains)
         // These routes are merged at the root level and rely on domain routing middleware
