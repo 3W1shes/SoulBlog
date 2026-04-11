@@ -256,3 +256,62 @@ pub mod surrealdb_datetime_option {
         }
     }
 }
+
+pub mod loose_i64 {
+    use super::*;
+    use serde::de::Error as _;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<i64, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Number(n) => n
+                .as_i64()
+                .ok_or_else(|| D::Error::custom("invalid numeric value")),
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                    Ok(0)
+                } else {
+                    trimmed
+                        .parse::<i64>()
+                        .map_err(|_| D::Error::custom(format!("invalid i64 string: {trimmed}")))
+                }
+            }
+            serde_json::Value::Null => Ok(0),
+            serde_json::Value::Object(map) if map.contains_key("None") => Ok(0),
+            other => Err(D::Error::custom(format!("invalid i64 value: {other}"))),
+        }
+    }
+}
+
+pub mod loose_datetime_now {
+    use super::*;
+    use serde::de::Error as _;
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<DateTime<Utc>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match value {
+            serde_json::Value::Null => Ok(Utc::now()),
+            serde_json::Value::String(s) => {
+                let trimmed = s.trim();
+                if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("none") {
+                    Ok(Utc::now())
+                } else {
+                    DateTime::parse_from_rfc3339(trimmed)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .map_err(|_| D::Error::custom(format!("invalid RFC3339 datetime: {trimmed}")))
+                }
+            }
+            serde_json::Value::Object(map) if map.contains_key("None") => Ok(Utc::now()),
+            other => surrealdb_datetime::deserialize(other.into_deserializer())
+                .map_err(|e| D::Error::custom(e.to_string()))
+                .or_else(|_| Err(D::Error::custom(format!("invalid datetime value: {other}")))),
+        }
+    }
+}

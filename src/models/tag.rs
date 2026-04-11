@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
 use validator::Validate;
-use crate::utils::serde_helpers::thing_id;
+use crate::utils::serde_helpers::{loose_datetime_now, loose_i64, thing_id};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tag {
@@ -10,10 +10,14 @@ pub struct Tag {
     pub name: String,
     pub slug: String,
     pub description: Option<String>,
+    #[serde(default, deserialize_with = "loose_i64::deserialize")]
     pub follower_count: i64,
+    #[serde(default, deserialize_with = "loose_i64::deserialize")]
     pub article_count: i64,
     pub is_featured: bool,
+    #[serde(default = "Utc::now", deserialize_with = "loose_datetime_now::deserialize")]
     pub created_at: DateTime<Utc>,
+    #[serde(default = "Utc::now", deserialize_with = "loose_datetime_now::deserialize")]
     pub updated_at: DateTime<Utc>,
 }
 
