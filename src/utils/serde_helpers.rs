@@ -309,9 +309,12 @@ pub mod loose_datetime_now {
                 }
             }
             serde_json::Value::Object(map) if map.contains_key("None") => Ok(Utc::now()),
-            other => surrealdb_datetime::deserialize(other.into_deserializer())
-                .map_err(|e| D::Error::custom(e.to_string()))
-                .or_else(|_| Err(D::Error::custom(format!("invalid datetime value: {other}")))),
+            other => {
+                let fallback = other.clone();
+                surrealdb_datetime::deserialize(other.into_deserializer())
+                    .map_err(|e| D::Error::custom(e.to_string()))
+                    .or_else(|_| Err(D::Error::custom(format!("invalid datetime value: {fallback}"))))
+            }
         }
     }
 }
