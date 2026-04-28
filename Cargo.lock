@@ -6535,6 +6535,7 @@ dependencies = [
 [[package]]
 name = "soulcore"
 version = "0.1.0"
+source = "git+https://github.com/3W1shes/soulcore.git?branch=main#31a1cfabea7b1c3107c71785e7d114efb3a8188f"
 dependencies = [
  "anyhow",
  "async-trait",
