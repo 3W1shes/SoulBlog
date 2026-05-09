@@ -55,6 +55,7 @@ use crate::{
         RealtimeService,
         DomainService,
         domain::DomainConfig,
+        SiteConfigService,
     },
     models::stripe::StripeConfig,
 };
@@ -153,6 +154,9 @@ async fn main() -> anyhow::Result<()> {
     };
     let domain_service = DomainService::new(db.clone(), domain_config).await?;
 
+    // 站点配置服务（单/平台都用，存 installed/owner/品牌/SEO）
+    let site_config_service = SiteConfigService::new(db.clone()).await?;
+
     // 创建应用状态
     let app_state = Arc::new(AppState {
         config: config.clone(),
@@ -178,6 +182,7 @@ async fn main() -> anyhow::Result<()> {
         websocket_service,
         realtime_service,
         domain_service,
+        site_config_service,
     });
 
     // 启动后台任务
@@ -195,44 +200,55 @@ async fn main() -> anyhow::Result<()> {
         );
 
     // 构建应用路由
-    let app = Router::new()
-        // API routes with /api/blog/ prefix (traditional API access)
+    // Single 与 Platform 共享的核心路由
+    let mut app = Router::new()
+        // 站点元信息 + 安装向导（两个模式都启用）
+        .nest("/api/blog/site", routes::site::router())
+        // 鉴权
         .nest("/api/blog/auth", routes::auth::router())
         .nest("/api/blog/users", routes::users::router())
+        // 文章 / 评论 / 标签 / 搜索 / 媒体 / AI 在两个模式都需要
         .nest("/api/blog/articles", routes::articles::router())
         .nest("/api/blog/comments", routes::comments::router())
         .nest("/api/blog/tags", routes::tags::router())
-        .nest("/api/blog/publications", routes::publications::router())
         .nest("/api/blog/search", routes::search::router())
         .nest("/api/blog/media", routes::media::router())
         .nest("/api/blog/stats", routes::stats::router())
         .nest("/api/blog/bookmarks", routes::bookmarks::router())
-        .nest("/api/blog/follows", routes::follows::router())
-        .nest("/api/blog/recommendations", routes::recommendations::router())
-        .nest("/api/blog/series", routes::series::router())
-        .nest("/api/blog/analytics", routes::analytics::router())
-        .nest("/api/blog/subscriptions", routes::subscriptions::router())
-        .nest("/api/blog/payments", routes::payments::router())
-        .nest("/api/blog/revenue", routes::revenue::router())
-        .nest("/api/blog/stripe", routes::stripe::router())
-        .nest("/api/blog/ws", routes::websocket::router())
-        .nest("/api/blog/domains", routes::domain::router())
         .nest("/api/blog/diagnostics", routes::diagnostics::router())
         .nest("/api/blog/notifications", routes::notifications::router())
         .nest("/api/blog/ai", routes::ai::router())
-        
+        // 站长后台（admin only），Single 模式必备；Platform 模式也提供给超管
+        .nest("/api/blog/admin", routes::admin::router())
+        // 用户自助路由（任何登录用户都能管自己的 api-keys 等）
+        .nest("/api/blog/me", routes::me::router());
+
+    // Platform-only：出版物 / 订阅 / 付费 / 域名 / 系列 等多用户多博客生态
+    #[cfg(feature = "platform")]
+    {
+        app = app
+            .nest("/api/blog/publications", routes::publications::router())
+            .nest("/api/blog/follows", routes::follows::router())
+            .nest("/api/blog/recommendations", routes::recommendations::router())
+            .nest("/api/blog/series", routes::series::router())
+            .nest("/api/blog/analytics", routes::analytics::router())
+            .nest("/api/blog/subscriptions", routes::subscriptions::router())
+            .nest("/api/blog/payments", routes::payments::router())
+            .nest("/api/blog/revenue", routes::revenue::router())
+            .nest("/api/blog/stripe", routes::stripe::router())
+            .nest("/api/blog/ws", routes::websocket::router())
+            .nest("/api/blog/domains", routes::domain::router())
+            .merge(routes::publication_content::router());
+    }
+
+    let app = app
         // Health check endpoints (no domain context needed)
         .route("/health", get(health_check))
         .route("/sso", get(sso_bridge))
-        
+
         // Agent API v1 (for OpenClaw / Agent integration)
         .nest("/agent/v1", agent::agent_router(app_state.clone()))
-        
-        // Domain-specific routes (work with custom domains and subdomains)
-        // These routes are merged at the root level and rely on domain routing middleware
-        // This must come after specific routes to avoid conflicts
-        .merge(routes::publication_content::router())
-        
+
         // Apply middleware layers (order matters - they are applied in reverse)
         .layer(cors)
         .layer(CompressionLayer::new())

@@ -22,3 +22,6 @@ pub mod publication_content;
 pub mod diagnostics;
 pub mod notifications;
 pub mod ai;
+pub mod site;
+pub mod admin;
+pub mod me;

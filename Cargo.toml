@@ -142,7 +142,13 @@ criterion = { version = "0.5", features = ["html_reports"] }
 proptest = "1.2"
 
 [features]
-default = []
+# 部署模式：single = 单用户博客（站长一人，访客只评论）
+#           platform = 多用户多博客平台（出版物/订阅/付费/域名）
+# 默认 platform 保持现有行为；single 与 platform 互斥
+default = ["platform"]
+single = []
+platform = []
+
 redis-cache = ["redis"]
 s3-storage = ["aws-sdk-s3", "aws-config"]
 email = []
@@ -162,6 +168,8 @@ strip = true
 
 [profile.dev]
 opt-level = 0
+debug = 0
 
 [profile.dev.package."*"]
-opt-level = 3
+opt-level = 0
+debug = 0

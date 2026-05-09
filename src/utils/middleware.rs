@@ -42,6 +42,21 @@ pub async fn auth_middleware(
     
     // 支持 Authorization 头和 SSO Cookie，两者任选其一
     if let Some(token) = extract_bearer_token(&headers) {
+        // ── 优先识别 SoulBlog API Key (sk-blog-xxx) ──
+        if token.starts_with("sk-blog-") {
+            match resolve_api_key_user(&app_state, &token).await {
+                Ok(user) => {
+                    info!("API Key auth resolved: {} ({})", user.id, user.email);
+                    request.extensions_mut().insert(user);
+                    return Ok(next.run(request).await);
+                }
+                Err(e) => {
+                    warn!("API Key auth failed: {}", e);
+                    // 不直接 401；让请求继续作为未认证（与 JWT 分支保持一致）
+                }
+            }
+        }
+
         // 验证 JWT
         match app_state.auth_service.verify_jwt(&token) {
             Ok(claims) => {
@@ -100,6 +115,88 @@ pub async fn auth_middleware(
     }
 
     Ok(next.run(request).await)
+}
+
+/// SoulBlog API Key 认证：sha256(token) 查 api_key 表，加载关联 user
+async fn resolve_api_key_user(state: &Arc<AppState>, raw_token: &str) -> Result<User, String> {
+    let key_hash = sha256_hex(raw_token);
+
+    let mut resp = state
+        .db
+        .query_with_params(
+            "SELECT user_id, scopes, expires_at FROM api_key
+             WHERE key_hash = $h AND is_deleted != true
+             LIMIT 1",
+            serde_json::json!({ "h": key_hash }),
+        )
+        .await
+        .map_err(|e| format!("db error: {}", e))?;
+    let rows: Vec<serde_json::Value> = resp.take(0).unwrap_or_default();
+    let row = rows.into_iter().next().ok_or_else(|| "key not found".to_string())?;
+
+    let user_id = row.get("user_id").and_then(|v| v.as_str())
+        .ok_or_else(|| "key missing user_id".to_string())?
+        .to_string();
+
+    // expires_at 校验：空字符串或 NONE 表示永久
+    if let Some(exp) = row.get("expires_at").and_then(|v| v.as_str()) {
+        if !exp.is_empty() {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(exp) {
+                if ts.with_timezone(&Utc) < Utc::now() {
+                    return Err("key expired".to_string());
+                }
+            }
+        }
+    }
+
+    let scopes_raw = row.get("scopes").cloned().unwrap_or_default();
+    let scopes: Vec<String> = serde_json::from_value(scopes_raw).unwrap_or_else(|_| vec!["read".into()]);
+    let mut perms: Vec<String> = vec!["article.read".into(), "comment.read".into(), "user.read_profile".into()];
+    if scopes.iter().any(|s| s == "write") {
+        perms.extend(["article.write".into(), "article.create".into(), "comment.create".into(), "user.update_profile".into()]);
+    }
+
+    // 加载 user_profile 拿 email/username
+    let profile = state.user_service.get_or_create_profile(&user_id, "", false, None, None).await.ok();
+    let (email, username, display_name, avatar_url) = match &profile {
+        Some(p) => (
+            p.email.clone().unwrap_or_default(),
+            Some(p.username.clone()),
+            Some(p.display_name.clone()),
+            p.avatar_url.clone(),
+        ),
+        None => (String::new(), None, None, None),
+    };
+
+    // fire-and-forget 更新 last_used_at
+    let db = state.db.clone();
+    let key_hash_clone = key_hash;
+    tokio::spawn(async move {
+        let _ = db
+            .query_with_params(
+                "UPDATE api_key SET last_used_at = time::now() WHERE key_hash = $h",
+                serde_json::json!({ "h": key_hash_clone }),
+            )
+            .await;
+    });
+
+    Ok(User {
+        id: user_id,
+        email,
+        username,
+        display_name,
+        avatar_url,
+        roles: vec!["user".to_string()],
+        permissions: perms,
+        is_verified: true,
+        created_at: Utc::now(),
+    })
+}
+
+fn sha256_hex(input: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input.as_bytes());
+    format!("{:x}", digest)
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {

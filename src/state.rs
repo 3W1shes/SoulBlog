@@ -23,6 +23,7 @@ use crate::{
         websocket::WebSocketService,
         realtime::RealtimeService,
         domain::{DomainService, DomainConfig},
+        site_config::SiteConfigService,
     },
 };
 
@@ -98,6 +99,9 @@ pub struct AppState {
     
     /// 域名管理服务
     pub domain_service: DomainService,
+
+    /// 站点配置服务（单/平台模式共享，存站点信息+installed标记）
+    pub site_config_service: SiteConfigService,
 }
 
 impl Default for AppState {

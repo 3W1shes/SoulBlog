@@ -5,3 +5,4 @@ config
 data
 .surreal_pid
 uploads
+*.log

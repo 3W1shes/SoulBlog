@@ -20,6 +20,7 @@ pub mod stripe;
 pub mod websocket;
 pub mod realtime;
 pub mod domain;
+pub mod site_config;
 
 // 重新导出常用类型
 pub use database::Database;
@@ -44,3 +45,4 @@ pub use stripe::StripeService;
 pub use websocket::WebSocketService;
 pub use realtime::RealtimeService;
 pub use domain::{DomainService, DomainConfig};
+pub use site_config::{SiteConfig, SiteConfigService};

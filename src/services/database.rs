@@ -246,16 +246,26 @@ impl Database {
 
     /// 初始化所有表 schema（SurrealDB 3.0 要求表必须先定义才能 SELECT）
     pub async fn initialize_schema(&self) -> Result<()> {
-        let tables = [
+        // Core tables: 单/平台模式都需要
+        let mut tables: Vec<&str> = vec![
             "user_auth", "user_profile", "article", "tag", "article_tag",
-            "comment", "clap", "follow", "bookmark", "notification",
-            "publication", "publication_member", "series", "series_article",
-            "subscription", "payment", "revenue", "media", "domain",
-            "recommendation", "analytics_event", "search_index",
+            "comment", "comment_clap", "clap", "follow", "bookmark", "notification",
+            "media", "recommendation", "analytics_event", "search_index",
             "user_tag_follow", "article_view", "article_share",
-            "publication_revenue", "stripe_customer", "stripe_account",
-            "ai_config",
+            "ai_config", "site_config", "api_key",
         ];
+
+        // Platform-only tables: 出版物/订阅/付费/域名/系列
+        #[cfg(feature = "platform")]
+        {
+            tables.extend(&[
+                "publication", "publication_member",
+                "series", "series_article",
+                "subscription", "payment", "revenue",
+                "domain", "publication_revenue",
+                "stripe_customer", "stripe_account",
+            ]);
+        }
         let mut sql = String::new();
         for table in &tables {
             sql.push_str(&format!("DEFINE TABLE IF NOT EXISTS {} SCHEMALESS;\n", table));
